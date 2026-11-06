@@ -27,6 +27,15 @@ conflict detection, TTL review, duplicate merge, and an audit trail.
 | Conflict apply | `factkit holo conflicts --apply` | retires the older fact through the provider's own API |
 | TTL review | `factkit holo stale` | age and volatile-attribute flags; never deletes |
 | Duplicate merge | `factkit holo dupes [--apply]` | near-identical facts, keep the higher-trust copy |
+| Pre-insert guard | `factkit holo guard --text "..."` | `ok` / `duplicate` / `near` / `conflict` before a fact is written; exit 1 blocks |
+| Chat approval | `factkit holo approve [--code X] [--apply]` | pending proposals with 4-char codes, accept or reject without the review TUI |
+| Confidence decay | `factkit holo decay` | age bands (fresh/aging/stale/expired), read-only suggestions |
+| Provenance | `factkit holo provenance [--apply]` | content hashes expose the provider's own writes |
+| Prose conflicts | `factkit holo prose [--apply]` | LLM-judged contradictions between same-subject facts, proposals only |
+| Live retrieval metrics | `factkit holo metrics` | hit@k, MRR, regression gate against the live store |
+| Store limits | `factkit holo limits [--apply]` | archive, audit/tombstone pruning, WAL-safe vacuum |
+| Time-aware query | `factkit holo asof --text "..." --as-of DATE` | what was true at a point in time |
+| Backup + drill | `factkit_backup.py [--drill]` | sqlite backup API, integrity check, restore rehearsal |
 | Semantic query | `factkit prefetch "..."` | exactly what the hook would inject |
 | Golden gate | `factkit gate` | retrieval regression suite with thresholds |
 | Standalone mode | `factkit init` / `embed` / `search` | own store, for use without Hermes |
@@ -45,7 +54,9 @@ FACTKIT_DB=~/.hermes/memory_store.db factkit embed   # index existing facts
 ```
 
 `install.sh` copies the plugin to `~/.hermes/plugins/factkit` and vendors the
-five modules it needs (`holo`, `config`, `embed`, `vectors`). The `holographic`
+modules it needs (`holo`, `config`, `embed`, `vectors`, `units`, `embedcache`,
+`maintenance`). `install.sh --check` compares every vendored file by sha256 and
+exits 1 on drift. The `holographic`
 provider is not modified, so its updates cannot overwrite this.
 
 Configure the endpoint in `~/.hermes/plugins/factkit/config.yaml` (mode `600`):
@@ -170,6 +181,106 @@ Writes go through the provider's `MemoryStore` API (`update_fact`, `remove_fact`
 `replace_fact`, `add_fact_status`), so FTS triggers, HRR vectors, entity links,
 trust scores and bank invalidation stay consistent. Every applied change writes
 an `audit` row with actor `factkit`.
+
+## Companion operations
+
+### Pre-insert guard
+
+Check a fact against the store before writing it. Read-only, and it exits 1
+whenever the insert should be blocked, so a script can branch on it:
+
+```bash
+factkit holo guard --db $DB --text "Raspberry Pi 2 has 4 GB RAM"
+# {"verdict": "conflict", "matches": [...], "suggestion": "...", "human": "..."}
+```
+
+`duplicate` (>= 0.98 with identical numeric tokens), `conflict` (same named
+attribute, different value, unit-normalised), `near` (0.90-0.97, merge the
+wording). The guard only sees attributes the text names: "has 16 GB" without
+the word RAM is reported `ok`, which is the intended conservative failure.
+
+### Chat approval
+
+Proposals live in `conflict_proposals`; the chat path is a short code per row:
+
+```bash
+factkit holo approve --db $DB                          # list pending + rendered text
+factkit holo approve --db $DB --code 1a2b --apply      # accept (tombstone path)
+factkit holo approve --db $DB --code 1a2b --reject     # status only
+```
+
+Accept delegates to `apply_conflict`/`apply_merge` with a fresh `chat-<ts>`
+batch, so the tombstone and undo path is unchanged. A second accept returns
+`already decided` and writes nothing.
+
+### Age, provenance, prose
+
+```bash
+factkit holo decay      --db $DB                  # bands by effective trust, read-only
+factkit holo provenance --db $DB                  # hash diff: changed / new / missing
+factkit holo provenance --db $DB --apply          # backfill rows for untracked facts
+factkit holo prose      --db $DB --apply --limit 10 \
+        --llm-url https://llm.local/v1 --llm-model <chat-model>
+```
+
+`decay` never rewrites `trust_score`: it reports what age does to it. Provenance
+is how provider writes become visible without intercepting them - the hash of
+each fact is compared on demand. `prose` queues only `contradiction` verdicts,
+with the pair and confidence in the evidence JSON.
+
+### Live retrieval metrics
+
+```bash
+factkit holo metrics --db $DB --smoke cases.json
+```
+
+Runs hybrid retrieval (BM25 + cosine) over the live store, reports hit@k, MRR
+and per-case ranks, and exits 1 when the gate fails. Cases use
+`{"query": ..., "expect": [fact_id, ...]}`; unknown ids are reported instead of
+being scored as misses.
+
+### Store limits, archive and backups
+
+```bash
+factkit holo limits --db $DB            # inspect + plan, writes nothing
+factkit holo limits --db $DB --apply    # prune tombstones/audit, then vacuum
+```
+
+`--apply` refuses plans that contain archival actions; archiving facts is a
+separate, explicit call (`factkit.limits.archive_facts`) that exports JSONL,
+re-reads it, compares ids and hashes, and only then deletes inside the same
+transaction. Vacuum is checkpointed first and blocked unless free disk is at
+least twice the database size.
+
+Backups use SQLite's backup API (not `cp`), force the copy out of WAL mode,
+run `PRAGMA integrity_check`, and keep the newest 14:
+
+```bash
+~/.hermes/scripts/factkit_backup.py          # silent on success
+~/.hermes/scripts/factkit_backup.py --drill  # restore + compare counts + FTS probe
+```
+
+Scheduled here: create daily at 02:40, restore drill Sundays at 05:00.
+
+### Time-aware queries
+
+`valid_from`/`valid_to` are additive columns on `facts` (NULL = open-ended):
+
+```bash
+factkit holo asof --db $DB --text "which proxy port" --as-of 2026-03-01
+```
+
+`as_of` is a **post-filter over `prefetch`** - the provider's own search is not
+time-aware, so retired rows can still arrive and are dropped afterwards. The
+live store was backfilled once (`valid_from` from `created_at`); `supersede`
+closes the old row and opens the new one without deleting either.
+
+### Embedding cache
+
+Query embeddings are cached in `~/.hermes/embed_cache.db` (sqlite, float32,
+768 dims ~3 KB/vector, 30-day TTL, 5000 entries). Warm queries drop from
+~0.13s to ~0.02s; a cache fault falls back to the endpoint and never fails a
+turn. Override the path with `FACTKIT_EMBED_CACHE`.
 
 ## Hybrid results
 

@@ -150,6 +150,18 @@ factkit holo maintain  --db $DB --auto --apply --limit 5 \
 factkit holo tombstones --db $DB                       # what a batch retired
 factkit holo undo       --db $DB --fact-id 17 --apply  # restore it under a new id
 factkit holo purge      --db $DB --days 90             # no dry run
+
+factkit holo guard      --db $DB --text "<candidate>"  # verdict before a write; exit 1 blocks
+factkit holo approve    --db $DB                       # pending proposals with 4-char codes
+factkit holo approve    --db $DB --code 1a2b --apply   # accept (tombstone path)
+factkit holo approve    --db $DB --code 1a2b --reject  # status only, facts untouched
+
+factkit holo decay      --db $DB                       # age bands, read-only
+factkit holo provenance --db $DB [--apply]             # hash diff vs provider writes
+factkit holo prose      --db $DB --apply --llm-url https://llm.local/v1 --llm-model <id>
+factkit holo metrics    --db $DB --smoke <cases.json>  # hit@k + MRR, exit 1 when the gate fails
+factkit holo limits     --db $DB [--apply]             # prune tombstones/audit, vacuum
+factkit holo asof       --db $DB --text "<query>" --as-of 2026-03-01
 ```
 
 Standalone mode (the factkit corpus):
@@ -172,6 +184,16 @@ Rules:
   revert the batch when the smoke gate regresses. Every retirement is
   tombstoned first, so it is undoable.
 * `--auto` is a policy switch, not consent. Do not enable it unless the user asks.
+* `holo guard` is the only pre-write check; `ok` means "no named attribute
+  conflicts", not "novel". Run it before bulk inserts.
+* Approvals: accept requires `--apply` (otherwise it is a dry run). Codes are
+  stable across listings; never re-derive a pair by hand.
+* `holo limits --apply` never archives facts; archiving is an explicit module
+  call that exports and verifies JSONL first. Vacuum needs free disk >= 2x DB.
+* `asof` post-filters `prefetch`: the provider search is not time-aware, so say
+  so when reporting historical answers.
+* Backups: `~/.hermes/scripts/factkit_backup.py` daily at 02:40, restore drill
+  Sundays at 05:00 (`factkit_drill.sh`). Both silent on success.
 * Smoke-case ids in `examples/smoke_cases.json` are placeholders; replace them
   with ids from the store being guarded or the gate checks nothing.
 * `bridge` requires an LLM endpoint and is opt-in; proposals are deduped.
