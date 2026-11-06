@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import re
 import os
 import subprocess
 import sys
@@ -62,7 +63,8 @@ def test_plugin_status_matches_clean_install(tmp_path):
     _, env = _install(tmp_path)
     res = _status(env)
     assert res.returncode == 0
-    assert "version  0.1.0" in res.stdout
+    manifest_version = re.search(r"^version:\s*(\S+)", (REPO / "integrations/hermes/factkit/plugin.yaml").read_text(), re.M).group(1)
+    assert f"version  {manifest_version}" in res.stdout
     assert "verdict  MATCH" in res.stdout
 
 
