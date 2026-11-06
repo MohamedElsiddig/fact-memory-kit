@@ -133,18 +133,47 @@ when" with `factkit audit --fact-id <id> --json`.
 
 ## 6. Maintenance loop (weekly or after a batch of changes)
 
+Companion mode (the live Hermes store):
+
+```bash
+DB=~/.hermes/memory_store.db
+
+factkit holo conflicts --db $DB   # same subject, same attribute, different value
+factkit holo stale     --db $DB   # aged facts and rotted ports/IPs/versions
+factkit holo dupes     --db $DB   # near-identical text; numbers must match
+
+factkit holo maintain  --db $DB   # classify + record proposals (no writes)
+factkit holo maintain  --db $DB --auto                     # auto class in the plan
+factkit holo maintain  --db $DB --auto --apply --limit 5 \
+        --smoke examples/smoke_cases.json                  # apply behind the gate
+
+factkit holo tombstones --db $DB                       # what a batch retired
+factkit holo undo       --db $DB --fact-id 17 --apply  # restore it under a new id
+factkit holo purge      --db $DB --days 90             # no dry run
+```
+
+Standalone mode (the factkit corpus):
+
 ```bash
 factkit conflicts scan     # stale contradictions
 factkit ttl scan           # aged facts and rotted ports/IPs/versions
 factkit bridge <file|state.db>  # optional: propose facts from a transcript or Hermes DB
-factkit review             # human decides; never auto-apply
+factkit review             # human decides
 factkit gate               # retrieval is still healthy
 factkit report             # numbers, not impressions
 ```
 
 Rules:
 
-* `conflicts` and `ttl` only *propose*. Do not auto-accept.
+* Report-only by default. `--apply` acts on exactly the report it is attached to.
+* `maintain` applies only the policy's auto class: near-duplicates ≥ 0.98, or a
+  `port`/`ip`/`version` conflict on a shared declared entity with a ≥ 7-day gap
+  and no trust downgrade. Hard limits: 5 per run, abort above 20% of the store,
+  revert the batch when the smoke gate regresses. Every retirement is
+  tombstoned first, so it is undoable.
+* `--auto` is a policy switch, not consent. Do not enable it unless the user asks.
+* Smoke-case ids in `examples/smoke_cases.json` are placeholders; replace them
+  with ids from the store being guarded or the gate checks nothing.
 * `bridge` requires an LLM endpoint and is opt-in; proposals are deduped.
 * Run `gate` after any change to retrieval or embeddings. A failed gate is a
   blocker: report the metric that dropped, do not call it "better".
