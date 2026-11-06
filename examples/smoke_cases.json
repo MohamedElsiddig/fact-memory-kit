@@ -1,0 +1,7 @@
+[
+  {"query": "which port does the local metrics service listen on", "expect": [1]},
+  {"query": "how much memory does the build host have", "expect": [2]},
+  {"query": "what version of the reverse proxy is installed", "expect": [3]},
+  {"query": "which address does the backup target use", "expect": [4]},
+  {"query": "how large is the scratch disk", "expect": [5]}
+]

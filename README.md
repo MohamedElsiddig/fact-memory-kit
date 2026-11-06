@@ -97,19 +97,74 @@ second model can be indexed beside the first and switched without touching facts
 
 Report-only by default. `--apply` is explicit and never implied.
 
+### Report
+
 ```bash
 DB=~/.hermes/memory_store.db
 
-factkit holo conflicts --db $DB            # pairs: keep ← retire, with attributes
-factkit holo conflicts --db $DB --apply
-factkit holo stale     --db $DB            # age + volatile attribute flags
-factkit holo stale     --db $DB --touch 17 --apply  # reviewed, still true
-factkit holo dupes     --db $DB
-factkit holo dupes     --db $DB --apply
-
-# let a local chat model judge prose pairs the attribute rule cannot see
-factkit holo conflicts --db $DB --adjudicate          # proposals only, max 50 pairs
+factkit holo conflicts --db $DB    # same subject + same attribute + different value
+factkit holo stale     --db $DB    # age and volatile-attribute flags
+factkit holo dupes     --db $DB    # near-identical text, digits included
 ```
+
+Each prints JSON and writes nothing: `conflicts` nominates keep ← retire pairs with
+the differing attributes, `stale` flags aged facts and rotted ports/IPs/versions,
+`dupes` groups near-identical wording. `--apply` on any one of them acts on that
+report alone (`stale --touch 17 --apply` marks a reviewed fact as still true).
+
+### Classify and propose
+
+```bash
+factkit holo maintain --db $DB                                  # plan only
+factkit holo maintain --db $DB --auto                           # auto class in the plan
+factkit holo maintain --db $DB --auto --limit 3 --max-ratio 0.10
+```
+
+`maintain` runs both detectors, enriches each pair with category, trust and source,
+and labels it `auto`, `propose` or `never` by the policy below. Nothing is written
+without `--apply`; `--auto` only enables the `auto` class. `--limit` caps applied
+changes (never above the policy's 5) and `--max-ratio` aborts the batch when
+candidates exceed that fraction of the store.
+
+### Apply behind a smoke gate
+
+```bash
+factkit holo maintain --db $DB --auto --apply --limit 5 \
+  --smoke examples/smoke_cases.json
+```
+
+The cases file is a JSON list of `{"query": ..., "expect": [fact_id]}`; a case
+passes when any expected id appears in the top 5 semantic hits. **Replace the
+placeholder ids in `examples/smoke_cases.json` with ids from your own store** —
+fact ids are local to a database. Recall runs before and after the batch; a query
+that passed before and fails after reverts every retirement in the batch. An
+unreachable embedder marks cases skipped (`degraded`), never passed.
+
+### Tombstones and undo
+
+```bash
+factkit holo tombstones --db $DB                  # unrestored retirements
+factkit holo undo --db $DB --fact-id 17 --apply   # re-add fact 17 from its tombstone
+```
+
+Every retirement is copied to `fact_tombstones` before the delete, so `undo`
+restores content, category, tags, trust and declared entities through
+`add_fact_status` — under a **new** fact id (`restored_from: 17`). `tombstones
+--apply` also lists rows that were already restored. `purge --days 90` permanently
+drops restored tombstones and unrestored ones older than the window; it has no dry
+run.
+
+### Policy
+
+| Class | What falls in it | Behaviour |
+|---|---|---|
+| auto-applies | duplicate ratio ≥ 0.98; a `port`/`ip`/`version` conflict on a shared declared entity where the retire side is ≥ 7 days older, its trust is not higher and neither side changed in 24h | only with `--auto --apply` |
+| proposed only | every other attribute slot, prose pairs, pairs missing category/trust/timestamps, `--adjudicate` output | queued in `conflict_proposals` on `--apply`, never retired |
+| never touched | cross-category pairs, user-origin or verbatim facts, configured denied categories | excluded even with `--auto` |
+| hard limits | 5 applies per run (`--limit` can only lower it); abort above 20% of the store (`--max-ratio` moves the line); revert the batch on a smoke regression; tombstone before delete | fixed in the policy, not bypassed by flags |
+
+The nightly cron (`factkit_maintain.py`) is proposal-only outside the policy's auto
+class, and silent unless it applied or proposed something.
 
 Writes go through the provider's `MemoryStore` API (`update_fact`, `remove_fact`,
 `replace_fact`, `add_fact_status`), so FTS triggers, HRR vectors, entity links,

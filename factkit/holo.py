@@ -73,7 +73,7 @@ ATTR_PATTERNS = [
     # port 8080 / port=8080 / :8080
     ("port", re.compile(r"\bport\s*[=:]?\s*(\d{2,5}(?:\s*-\s*\d{2,5})?)")),
     ("port", re.compile(r"(?<![\d.]):(\d{2,5})\b")),
-    # 10.0.0.5
+    # 192.0.2.5 (documentation range)
     ("ip", re.compile(r"\b(\d{1,3}(?:\.\d{1,3}){3})\b")),
     # caddy 2.7.6 / python3.12 / v1.2.3
     ("version", re.compile(r"\b([a-z][a-z0-9_-]{2,})\s+v?(\d+\.\d+(?:\.\d+)?)\b")),
@@ -474,18 +474,58 @@ def _enrich(store, pair: dict) -> dict:
     return out
 
 
+def _ensure_proposal_columns(store) -> None:
+    """Add the ``batch_id`` / ``evidence`` columns to an older ``conflict_proposals``.
+
+    Additive only: ``ALTER TABLE ... ADD COLUMN`` when missing, never a rewrite or
+    drop, so existing rows and their values survive the migration.
+    """
+    cols = {str(r[1]) for r in store._conn.execute("PRAGMA table_info(conflict_proposals)")}
+    for name, ddl in (("batch_id", "batch_id TEXT"), ("evidence", "evidence TEXT")):
+        if name in cols:
+            continue
+        with store._tx():
+            store._write(f"ALTER TABLE conflict_proposals ADD COLUMN {ddl}")
+
+
+def _proposal_evidence(store, pair: dict, ratio: float) -> str:
+    """Compact JSON evidence for one proposal (the facts and the disputed slot)."""
+    import json
+
+    diffs = pair.get("diffs") or []
+    texts = {}
+    for side in ("keep", "retire"):
+        text = pair.get(f"{side}_text")
+        if text is None:
+            row = store._one("SELECT content FROM facts WHERE fact_id = ?", (int(pair[side]),))
+            text = row["content"] if row is not None else ""
+        texts[side] = text or ""
+    return json.dumps(
+        {"kind": pair.get("kind") or "conflict",
+         "slot": diffs[0].get("slot") if diffs else None,
+         "keep_text": texts["keep"],
+         "retire_text": texts["retire"],
+         "ratio": ratio},
+        sort_keys=True, ensure_ascii=False)
+
+
 def _record_proposal(store, pair: dict, status: str, batch_id: str | None) -> None:
     from . import maintenance
     maintenance.ensure_tombstones(store)   # keeps schema creation in one place
+    _ensure_proposal_columns(store)        # additive: old DBs gain the new columns
     diffs = pair.get("diffs") or []
     slots = ",".join(str(d.get("slot", "")) for d in diffs) or "duplicate"
     delta = " | ".join(f"{d.get('slot')}: {d.get('keep')} vs {d.get('retire')}" for d in diffs) or "same content"
+    ratio = float(pair.get("jaccard") or pair.get("ratio") or 0.0)
+    evidence = _proposal_evidence(store, pair, ratio)
     with store._tx():
         store._write(
             "INSERT OR IGNORE INTO conflict_proposals"
-            "(keep_id, retire_id, jaccard, slots, delta, status, note) VALUES (?,?,?,?,?,?,?)",
-            (int(pair["keep"]), int(pair["retire"]), float(pair.get("jaccard") or pair.get("ratio") or 0.0),
-             slots, delta, status, f"batch={batch_id}" if batch_id else ""))
+            "(keep_id, retire_id, jaccard, slots, delta, status, note, batch_id, evidence) "
+            "VALUES (?,?,?,?,?,?,?,?,?)",
+            (int(pair["keep"]), int(pair["retire"]), ratio,
+             slots, delta, status, f"batch={batch_id}" if batch_id else "",
+             batch_id, evidence))
 
 
 def maintain(store, *, policy=None, dry_run: bool = True, limit: int | None = None,
