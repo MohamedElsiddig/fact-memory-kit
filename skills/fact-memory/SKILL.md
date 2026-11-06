@@ -1,90 +1,102 @@
 ---
 name: fact-memory
-description: Use when a task needs the user's stored facts, devices, preferences or past decisions — retrieve, store and maintain long-term memory with factkit.
-tags: memory, facts, retrieval, rag, sqlite
+description: Use when retrieving or maintaining the user's stored facts.
+tags: memory, facts, retrieval, rag, sqlite, holographic
 ---
 
 # Fact Memory
 
-Long-term memory lives in a local SQLite store managed by `factkit`
-(this repo). Treat it as the first source for anything user-specific, and as a
-system of record you must not corrupt.
+Long-term memory is the Hermes holographic store at
+`~/.hermes/memory_store.db`, managed by the `holographic` provider and enhanced
+by the `factkit` companion plugin (this repo). Treat it as the first source for
+anything user-specific, and as a system of record you must not corrupt.
 
 Full command reference and failure modes: `AGENTS.md`. Human overview: `README.md`.
 
 ## Retrieval order
 
-1. `factkit search "<query>" -k 5 --json` — stored facts.
-2. Project wiki / knowledge base (OpenKnowledge MCP, then markdown files).
-3. Live system (`ss`, `lsof`, `systemctl`, `df`) for current state.
-4. Public web only when the above cannot answer.
+1. `fact_store` (holographic provider) — FTS + HRR + trust, the ranking of record.
+2. Semantic block injected by the `factkit` `pre_llm_call` hook (up to 3 facts).
+3. Project wiki / knowledge base (OpenKnowledge MCP, then markdown files).
+4. Live system (`ss`, `lsof`, `systemctl`, `df`) for current state.
+5. Public web only when the above cannot answer.
 
 Stored facts outrank live readings: the user's value is the intended one
 (upgraded RAM, moved service, changed port).
 
-Unsure which source applies? `factkit route "<query>"` returns the route and the
-command to run next.
-
 ## Storing
 
 Store only durable, self-contained statements: specs, preferences, decisions,
-configurations, identities. Resolve pronouns to real nouns.
+configurations, identities. Resolve pronouns to real nouns. Use the `fact_store`
+tool, never raw SQL.
 
 ```bash
-factkit add "Atlas Server runs Debian at 192.0.2.10 with 16 GB RAM" \
-  -c entity -t pi5,specs --trust 0.9
+factkit capture "<text>"        # save / score / reasons before storing
 ```
 
-Ask `factkit capture "<text>"` when unsure; it returns `save`, `score`, `reasons`.
 Never store questions, greetings, task state or transient secrets.
 
-## Changing
+## How the enhancement works
 
-* `factkit update <id> --content "..." --reason "..."` — corrections.
-* Contradiction: add the new fact, run `factkit conflicts scan`, then resolve in
-  `factkit review`. The golden rule keeps the newer `updated_at` and proposes the
-  older for retirement.
-* Delete only on explicit user request, always with `--reason`.
-* Every mutation is audited: `factkit audit --fact-id <id> --json`.
+| Layer | Behaviour |
+|---|---|
+| `pre_llm_call` | embeds the user message, injects up to 3 facts; deduped against the session and the conversation history |
+| `transform_tool_result` | re-ranks `fact_store` search results with RRF (provider order + embeddings); provider hits are never dropped |
+| breaker | 3 failed embedding calls → 5 minutes off, turns pay 0ms |
+| prewarm | 10-minute cron keeps the embedding model resident |
+
+Embeddings live in `fact_embeddings` beside the facts; `hrr_vector` and the
+provider's own ranking are untouched.
 
 ## Maintenance
 
+Report-only by default; `--apply` is explicit and never implied.
+
 ```bash
-factkit conflicts scan     # stale contradictions (proposals only)
-factkit ttl scan           # age + rotted ports/IPs/versions (proposals only)
-factkit bridge <file|state.db>  # opt-in: transcript or Hermes DB
-factkit review             # accept / reject / skip
-factkit gate               # retrieval regression gate
-factkit report             # coverage, p50/p95 latency, hit rate, backlog
+DB=~/.hermes/memory_store.db
+
+factkit holo conflicts --db $DB             # same subject, same attribute, different value
+factkit holo stale     --db $DB             # age + volatile attributes
+factkit holo dupes     --db $DB             # near-identical text (numbers must match)
+factkit holo maintain  --db $DB             # classify + propose; --auto enables the auto class
+factkit holo maintain  --db $DB --auto --apply --limit 5 --smoke cases.json
+factkit holo tombstones --db $DB            # what a batch retired
+factkit holo undo --db $DB --fact-id 17 --apply
 ```
 
-Automation only proposes. A human accepts. Refuse to auto-apply conflict or TTL
-resolutions unless the user explicitly asks for that policy.
+`maintain` applies only the policy's `auto` class (near-duplicates ≥ 0.98, or a
+`port`/`ip`/`version` conflict on a shared declared entity with a ≥ 7-day gap and
+no trust downgrade), capped at 5 per run, aborted when candidates exceed 20% of
+the store, reverted when the smoke gate regresses. Every retirement is
+tombstoned before deletion.
+
+Automation runs proposal-only by default (nightly cron). Do not enable the auto
+class without the user's explicit instruction.
 
 ## Quality bar
 
-* Run `factkit gate` after any change to retrieval, embeddings or the golden set.
-* Quote `r_at_5`, `mrr`, `hit_rate` and `fp` — never say "search feels better".
+* `factkit gate` guards the standalone corpus; the live store uses the smoke
+  cases passed to `maintain`.
+* Quote `r_at_5`, `mrr`, `hit_rate`, `fp` — never say "search feels better".
 * `factkit embed` backfills new facts; coverage below 100% means facts were added
-  while the embedding endpoint was down.
-* Embeddings are optional: with the endpoint down, reads degrade to BM25 and
-  writes still work.
+  while the endpoint was down.
+* Values are compared after unit normalisation: `16GB` == `16384MB`,
+  `3.6GHz` == `3600MHz`, `8080` conflicts with `8000-8100`.
 
 ## Pitfalls
 
-* **Do not edit the SQLite file directly.** FTS triggers, audit rows and
-  embeddings all bypass you.
-* **Different subjects are not conflicts.** Entity sets must match; Atlas Server vs Beacon Mini
-  share tokens but are different machines.
-* **Slots are case-normalised.** `16 GB` → `16gb`; a raw string comparison misses
-  the conflict.
-* **Retiring a fact invalidates golden cases** that reference it. The review path
-  remaps them; manual deletions need `factkit golden-write`.
-* **Per-model embeddings.** A new model indexes alongside the old one; switch with
-  `FACTKIT_EMBED_MODEL`, do not delete the previous rows unless asked.
-* **One writer at a time.** WAL allows concurrent readers, but keep batch writes
-  short to avoid `database is locked`.
-* **factkit and Hermes stores are separate.** Import with `factkit import --hermes`
-  (read-only, preserves timestamps/entities); do not edit `memory_store.db` directly.
-* **Dashboard auth is opt-in.** Set `FACTKIT_DASHBOARD_TOKEN` before exposing it;
-  without a token every route is open to whoever can reach the port.
+* **Never edit `~/.hermes/plugins/holographic`.** Provider updates overwrite it.
+  Writes go through its `MemoryStore` API (`add_fact_status`, `update_fact`,
+  `replace_fact`, `remove_fact`).
+* **Never edit `~/.hermes/plugins/factkit` by hand.** It is a copy: change the
+  repo, re-run `install.sh`, verify with `install.sh --check` or
+  `factkit plugin-status` (both must print MATCH).
+* **Different subjects are not conflicts.** A shared city or vendor is not a
+  subject; entity sets must match.
+* **Same sentence, different number is not a duplicate.** `filler fact 1` and
+  `filler fact 2` score 0.95 similarity and are different claims.
+* **Ports and IPs are identity values.** On the same subject, `7000` vs `7001` is
+  a conflict, not two acceptable truths.
+* **Retiring a fact invalidates golden cases** that reference it.
+* **One writer at a time.** WAL allows concurrent readers; keep batches short.
+* **Dashboard auth is opt-in.** Set `FACTKIT_DASHBOARD_TOKEN` before exposing it.
