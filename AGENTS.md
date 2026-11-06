@@ -3,6 +3,20 @@
 You are an agent with shell access. This file is your operating manual for
 `fact-memory-kit`. Follow it instead of inventing a workflow.
 
+## Rules for this repo
+
+- Never edit the installed plugin by hand: `~/.hermes/plugins/factkit` is a copy.
+  Change `integrations/hermes/factkit/` (or the module it vendors), then run
+  `bash integrations/hermes/factkit/install.sh` and confirm with
+  `install.sh --check` / `factkit plugin-status` (both must print MATCH).
+- Never patch `~/.hermes/plugins/holographic`; provider updates overwrite it.
+  All writes go through its `MemoryStore` API.
+- Embedding calls are capped at 1.5s and guarded by a breaker. Do not raise the
+  timeout to hide a slow endpoint; fix the endpoint or accept degraded recall.
+- Conflict values are compared through `factkit.units`. Add a normalisation case
+  there before widening any regex.
+- LLM adjudication is proposals only. It never writes to the store.
+
 ## 0. Pick the mode
 
 **Companion (default).** If the host already runs Hermes holographic memory,

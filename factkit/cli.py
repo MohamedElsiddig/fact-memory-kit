@@ -677,6 +677,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--slot-days", type=int, default=180)
     p.add_argument("--threshold", type=float, default=0.92)
     p.add_argument("--touch", type=int, metavar="FACT_ID", help="mark a reviewed fact as still true")
+    p.add_argument("--adjudicate", action="store_true",
+                   help="ask the local LLM to judge prose contradictions (proposals only)")
+    p.add_argument("--llm-model", default=None, help="override the adjudicator model")
     p.set_defaults(func=cmd_holo)
 
     p = sub.add_parser("prefetch", help="show semantic recall for a message")
@@ -733,7 +736,18 @@ def cmd_holo(args) -> int:
     action = args.action
     if action == "conflicts":
         pairs = holo.find_conflicts(args.db)
-        _print_json({"db": args.db, "conflicts": len(pairs), "pairs": pairs})
+        if args.adjudicate and pairs:
+            from .adjudicate import adjudicate
+            from .config import Config
+            cfg = Config.load(args.db)
+            if args.llm_model:
+                cfg.llm_model = args.llm_model
+            judged = adjudicate(pairs, cfg)
+            _print_json({"db": args.db, "candidates": len(pairs),
+                         "conflicts": len(judged), "pairs": judged})
+            pairs = judged
+        else:
+            _print_json({"db": args.db, "conflicts": len(pairs), "pairs": pairs})
         if args.apply and pairs:
             done = [holo.apply_conflict(store, p, dry_run=False) for p in pairs]
             _print_json({"applied": done})

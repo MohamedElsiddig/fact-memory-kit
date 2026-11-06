@@ -106,12 +106,35 @@ factkit holo stale     --db $DB            # age + volatile attribute flags
 factkit holo stale     --db $DB --touch 17 --apply  # reviewed, still true
 factkit holo dupes     --db $DB
 factkit holo dupes     --db $DB --apply
+
+# let a local chat model judge prose pairs the attribute rule cannot see
+factkit holo conflicts --db $DB --adjudicate          # proposals only, max 50 pairs
 ```
 
 Writes go through the provider's `MemoryStore` API (`update_fact`, `remove_fact`,
 `replace_fact`, `add_fact_status`), so FTS triggers, HRR vectors, entity links,
 trust scores and bank invalidation stay consistent. Every applied change writes
 an `audit` row with actor `factkit`.
+
+## Hybrid results
+
+`fact_store` search results are re-ranked in a `transform_tool_result` hook: the
+provider's ordering (FTS + HRR + trust) is fused with an embedding channel using
+reciprocal rank fusion. Two invariants:
+
+- a provider hit is never dropped or moved below a fact it already ranked over
+  unless the embedding channel is decisively stronger;
+- half the result slots stay open, so a fact the provider missed can enter.
+
+`factkit plugin-status` proves the installed copy matches the repo; the hook
+cannot reorder the provider's own prefetch block, only the tool result.
+
+## Resilience
+
+Every embedding call is capped at 1.5s. After three consecutive failures the
+breaker opens for 5 minutes: turns then pay 0ms and lose semantic recall rather
+than waiting on a dead endpoint. `~/.hermes/scripts/factkit_prewarm.py` runs on a
+10-minute cron to keep the model resident, which removes the ~1.5s cold start.
 
 ## The golden rule
 
@@ -123,7 +146,9 @@ same subject  +  same attribute  +  different value  →  newer updated_at wins
 
 Attributes are named, not just typed: `ram`, `storage`, `cores`, `clock`, `port`,
 `ip`, and software versions (`caddy 2.7.6`). Two facts conflict only when the
-attribute names match and the values differ.
+attribute names match and the values differ — after unit normalisation, so
+`16GB` and `16384MB` agree, `3.6GHz` and `3600MHz` agree, and `8080` conflicts
+with the range `8000-8100` but not with `9000-9100`.
 
 Subject matching requires a shared *declared* entity or a high content overlap.
 A shared city or vendor alone is not a subject — that check produced 37 false
