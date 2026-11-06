@@ -16,3 +16,6 @@ golden.json
 .DS_Store
 .idea/
 .vscode/
+
+# Repo roadmap kept local (not part of the published package)
+ROADMAP.md
