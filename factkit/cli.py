@@ -7,7 +7,7 @@ import os
 import sys
 from pathlib import Path
 
-from . import (bridge, bulk, capture, conflicts, entities, golden, metrics,
+from . import (bridge, bulk, capture, conflicts, entities, golden, holo, metrics,
                router, ttl, tui)
 from .config import Config
 from .embed import EmbeddingClient, from_config
@@ -576,6 +576,22 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--alias")
     p.set_defaults(func=cmd_entity)
 
+    p = sub.add_parser("holo", help="maintain the live holographic memory store")
+    p.add_argument("action", choices=["conflicts", "stale", "dupes"])
+    p.add_argument("--db", default=str(Path.home() / ".hermes" / "memory_store.db"))
+    p.add_argument("--apply", action="store_true", help="write changes (default: report only)")
+    p.add_argument("--days", type=int, default=90)
+    p.add_argument("--slot-days", type=int, default=180)
+    p.add_argument("--threshold", type=float, default=0.92)
+    p.add_argument("--touch", type=int, metavar="FACT_ID", help="mark a reviewed fact as still true")
+    p.set_defaults(func=cmd_holo)
+
+    p = sub.add_parser("prefetch", help="show semantic recall for a message")
+    p.add_argument("message")
+    p.add_argument("--db", default=str(Path.home() / ".hermes" / "memory_store.db"))
+    p.add_argument("--limit", type=int, default=5)
+    p.set_defaults(func=cmd_prefetch)
+
     p = sub.add_parser("sync", help="mirror a Hermes memory_store.db into factkit")
     p.add_argument("--hermes", required=True, metavar="MEMORY_DB")
     p.add_argument("--dry-run", action="store_true")
@@ -611,4 +627,36 @@ def cmd_sync(args) -> int:
             index_embeddings(store, cfg)
         except SystemExit as exc:
             print(f"warning: {exc}", file=sys.stderr)
+    return 0
+
+
+def cmd_holo(args) -> int:
+    store = holo.load_plugin_store(args.db)
+    action = args.action
+    if action == "conflicts":
+        pairs = holo.find_conflicts(args.db)
+        _print_json({"db": args.db, "conflicts": len(pairs), "pairs": pairs})
+        if args.apply and pairs:
+            done = [holo.apply_conflict(store, p, dry_run=False) for p in pairs]
+            _print_json({"applied": done})
+        return 0
+    if action == "stale":
+        rows = holo.find_stale(args.db, days=args.days, slot_days=args.slot_days)
+        _print_json({"db": args.db, "stale": len(rows), "facts": rows})
+        if args.touch:
+            _print_json({"touched": holo.touch_fact(store, args.touch, dry_run=not args.apply)})
+        return 0
+    if action == "dupes":
+        pairs = holo.merge_duplicates(args.db, threshold=args.threshold)
+        _print_json({"db": args.db, "duplicates": len(pairs), "pairs": pairs})
+        if args.apply and pairs:
+            _print_json({"applied": [holo.apply_merge(store, p, dry_run=False) for p in pairs]})
+        return 0
+    raise SystemExit(f"unknown action {action}")
+
+
+def cmd_prefetch(args) -> int:
+    """What the pre_llm_call hook would inject for a message."""
+    store = holo.load_plugin_store(args.db)
+    print(json.dumps(holo.prefetch(store, args.message, limit=args.limit), indent=2))
     return 0

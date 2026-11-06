@@ -374,3 +374,73 @@ def test_dashboard_requires_token(tmp_path, store):
         assert exc.value.code == 401
     finally:
         httpd.shutdown(); httpd.server_close()
+
+
+# ------------------------------------------------- holographic store (holo)
+from factkit import holo  # noqa: E402
+def _holo_db(path, facts, declared=None):
+    import sqlite3
+    con = sqlite3.connect(path)
+    con.executescript("""
+    CREATE TABLE facts(fact_id INTEGER PRIMARY KEY, content TEXT, category TEXT,
+                       tags TEXT, trust_score REAL, created_at TEXT, updated_at TEXT,
+                       hrr_vector BLOB);
+    CREATE TABLE entities(entity_id INTEGER PRIMARY KEY, name TEXT,
+                          entity_type TEXT DEFAULT 'unknown');
+    CREATE TABLE fact_entities(fact_id INTEGER, entity_id INTEGER);
+    """)
+    for i, (content, updated) in enumerate(facts, 1):
+        con.execute("INSERT INTO facts(fact_id,content,category,tags,trust_score,created_at,updated_at) "
+                    "VALUES (?,?,?,?,?,?,?)", (i, content, "entity", "", 0.8, updated, updated))
+    for i, (name, kind, ids) in enumerate(declared or [], 1):
+        con.execute("INSERT INTO entities VALUES (?,?,?)", (i, name, kind))
+        for fid in ids:
+            con.execute("INSERT INTO fact_entities VALUES (?,?)", (fid, i))
+    con.commit(); con.close()
+    return path
+
+
+def test_conflict_same_attribute_different_value(tmp_path):
+    db = _holo_db(tmp_path / "h.db", [
+        ("Atlas Server has 16 GB RAM", "2026-01-01 00:00:00"),
+        ("Atlas Server has 8 GB RAM", "2026-06-01 00:00:00"),
+    ], [("Atlas Server", "declared", [1, 2])])
+    found = holo.find_conflicts(db)
+    assert len(found) == 1
+    pair = found[0]
+    assert (pair["keep"], pair["retire"]) == (2, 1)      # newer wins
+    assert pair["diffs"][0]["slot"] == "ram"
+
+
+def test_conflict_ignores_different_attributes(tmp_path):
+    db = _holo_db(tmp_path / "h.db", [
+        ("Atlas Server has 16 GB RAM", "2026-01-01 00:00:00"),
+        ("Atlas Server runs at 2.4 GHz", "2026-06-01 00:00:00"),
+    ], [("Atlas Server", "declared", [1, 2])])
+    assert holo.find_conflicts(db) == []
+
+
+def test_conflict_ignores_shared_place_only(tmp_path):
+    db = _holo_db(tmp_path / "h.db", [
+        ("Car registered in Abu Dhabi, VIN X, file ~/wikis/car/a.md", "2026-01-01 00:00:00"),
+        ("Engineer in Abu Dhabi, CV at /home/u/cv.pdf", "2026-06-01 00:00:00"),
+    ], [("Abu Dhabi", "unknown", [1, 2])])
+    assert holo.find_conflicts(db) == []
+
+
+def test_conflict_port_requires_same_attribute(tmp_path):
+    db = _holo_db(tmp_path / "h.db", [
+        ("Transcriber listens on port 8010", "2026-01-01 00:00:00"),
+        ("Dashboard listens on port 9119", "2026-06-01 00:00:00"),
+    ])
+    assert holo.find_conflicts(db) == []
+
+
+def test_stale_flags_old_volatile_fact(tmp_path):
+    db = _holo_db(tmp_path / "h.db", [
+        ("Proxy listens on port 8080", "2020-01-01 00:00:00"),
+        ("Atlas Server has 16 GB RAM", "2020-01-01 00:00:00"),
+    ])
+    stale = holo.find_stale(db, days=2000)
+    assert {s["fact_id"] for s in stale} == {1, 2}
+    assert any(s["reason"] == "age" for s in stale)
