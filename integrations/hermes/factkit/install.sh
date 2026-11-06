@@ -31,7 +31,7 @@ plugins="${HERMES_PLUGINS:-$HOME/.hermes/plugins}"
 dest="$plugins/factkit"
 
 # vendored files: installed path -> repo source
-labels=(__init__.py plugin.yaml factkit/config.py factkit/embed.py factkit/vectors.py factkit/units.py factkit/maintenance.py factkit/embedcache.py factkit/holo.py)
+labels=(__init__.py plugin.yaml factkit/config.py factkit/embed.py factkit/vectors.py factkit/units.py factkit/embedcache.py factkit/maintenance.py factkit/holo.py)
 sources=(
   "$here/plugin_init.py"
   "$here/plugin.yaml"
@@ -101,7 +101,7 @@ cp "$here/plugin_init.py" "$dest/__init__.py"
 cp "$here/plugin.yaml" "$dest/plugin.yaml"
 
 # vendored subset: holo machinery only, no CLI or server
-for f in config.py embed.py vectors.py units.py maintenance.py holo.py; do
+for f in config.py embed.py vectors.py units.py embedcache.py maintenance.py holo.py; do
   cp "$repo/factkit/$f" "$dest/factkit/$f"
 done
 cat > "$dest/factkit/__init__.py" <<'PY'

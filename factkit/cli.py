@@ -690,7 +690,8 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("holo", help="maintain the live holographic memory store")
     p.add_argument("action", choices=["conflicts", "stale", "dupes", "maintain",
                                       "undo", "tombstones", "purge", "guard",
-                                      "decay", "provenance", "prose", "metrics"])
+                                      "decay", "provenance", "prose", "metrics",
+                                      "limits", "approve", "asof"])
     p.add_argument("--db", default=str(Path.home() / ".hermes" / "memory_store.db"))
     p.add_argument("--apply", action="store_true", help="write changes (default: report only)")
     p.add_argument("--days", type=int, default=90)
@@ -707,6 +708,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--smoke", metavar="JSON", default=None,
                    help="smoke cases file; a regression reverts the batch")
     p.add_argument("--fact-id", type=int, default=None, help="fact id for undo")
+    p.add_argument("--code", default=None, help="proposal code for 'approve'")
+    p.add_argument("--reject", action="store_true", help="reject instead of accept")
+    p.add_argument("--as-of", dest="as_of", default=None, metavar="ISO",
+                   help="point in time for 'asof' queries")
     p.add_argument("--text", default=None, metavar="FACT",
                    help="candidate fact text for 'guard' (checks before writing)")
     p.add_argument("--max-ratio", type=float, default=0.20,
@@ -869,6 +874,37 @@ def cmd_holo(args) -> int:
         verdict = live_metrics.gate(result)
         _print_json({"db": args.db, "cases": path, **result, "gate": verdict})
         return 0 if verdict["ok"] else 1
+    if action == "limits":
+        from . import limits
+        report = limits.inspect(store)
+        plan = limits.plan(store)
+        applied = None
+        if args.apply:
+            applied = limits.apply(store, plan, confirm_token=limits.APPLY_TOKEN)
+        _print_json({"db": args.db, "inspect": report, "plan": plan, "applied": applied})
+        return 0
+    if action == "approve":
+        from . import approvals
+        if not args.code:
+            rows = approvals.pending(store, limit=args.limit or 10)
+            _print_json({"db": args.db, "pending": len(rows), "rows": rows,
+                         "text": approvals.render(rows)})
+            return 0
+        result = approvals.decide(store, args.code,
+                                  action="reject" if args.reject else "accept",
+                                  actor="cli", dry_run=not args.apply)
+        _print_json({"db": args.db, **result})
+        return 0 if result.get("ok") else 1
+    if action == "asof":
+        from . import temporal
+        if not (args.text and args.as_of):
+            _print_json({"error": "--text and --as-of are required for asof"})
+            return 2
+        temporal.ensure_schema(store)
+        out = temporal.as_of_query(store, args.text, as_of=args.as_of,
+                                   limit=args.limit or 5)
+        _print_json({"db": args.db, **out})
+        return 0 if out.get("available", True) else 1
     if action == "guard":
         from . import guard
         if not args.text:
