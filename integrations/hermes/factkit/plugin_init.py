@@ -5,6 +5,8 @@ same ``~/.hermes/memory_store.db`` and adds:
 
 * a ``pre_llm_call`` context block with embedding-based recall for the current
   message (the provider's own keyword/HRR prefetch still runs untouched);
+* history-aware dedupe: a fact already injected earlier in the conversation
+  (or this process) is not injected again;
 * post-session indexing of facts written since the last run.
 
 Writes (conflict apply, TTL review) are not automatic; they run through
@@ -21,6 +23,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -166,8 +169,15 @@ def on_pre_llm_call(**kwargs):
     if not hits:
         return []
 
-    seen = _seen_contents()
-    hits = [h for h in hits if _norm(h["content"])[:60] not in seen]
+    history = kwargs.get("conversation_history") or kwargs.get("history") or []
+    try:
+        history_text = _history_text(history)
+        seen = _seen_contents() | _history_contents(history)
+        hits = [h for h in hits if not _dup(h["content"], seen, history_text)]
+    except Exception as exc:  # noqa: BLE001 - dedupe must never break a turn
+        logger.debug("factkit dedupe skipped: %s", exc)
+        seen = _seen_contents()
+        hits = [h for h in hits if _norm(h["content"])[:60] not in seen]
     if not hits:
         return []
     lines = ["<semantic-memory>",
@@ -187,6 +197,50 @@ def _norm(text: str) -> str:
 def _seen_contents() -> set[str]:
     """Fact texts already shown this session (context block or tool results)."""
     return {_norm(c)[:60] for c in _SEEN.get("contents", set())}
+
+
+_HISTORY_MESSAGES = 12
+_FACT_LINE = re.compile(r"^[-*]\s*#\d+\s*(?:\([^)]*\))?\s*(.+)$")
+_NUMBERED = re.compile(r"#\d+")
+
+
+def _history_text(history) -> str:
+    """Normalized text of the last few messages (dicts or objects, str/parts)."""
+    if not isinstance(history, (list, tuple)) or not history:
+        return ""
+    chunks = []
+    for item in list(history)[-_HISTORY_MESSAGES:]:
+        content = item.get("content") if isinstance(item, dict) else getattr(item, "content", None)
+        if isinstance(content, str):
+            chunks.append(content)
+        elif isinstance(content, (list, tuple)):
+            for part in content:
+                text = part.get("text") if isinstance(part, dict) else getattr(part, "text", None)
+                if isinstance(text, str):
+                    chunks.append(text)
+    return _norm("\n".join(chunks))
+
+
+def _history_contents(history) -> set[str]:
+    """60-char prefixes of fact lines already shown in the conversation."""
+    text = _history_text(history)
+    if not text:
+        return set()
+    found = set()
+    for line in text.splitlines():
+        line = line.strip()
+        if not (_NUMBERED.search(line) or "<semantic-memory>" in line):
+            continue
+        match = _FACT_LINE.match(line)
+        # drop the "- #id (score) " frame so the prefix matches the raw fact text
+        found.add(_norm(match.group(1) if match else line)[:60])
+    return found
+
+
+def _dup(content: str, seen: set[str], history_text: str) -> bool:
+    """True when this fact was already injected this process or in history."""
+    prefix = _norm(content)[:60]
+    return prefix in seen or bool(history_text and prefix in history_text)
 
 
 def _mark_seen(contents) -> None:

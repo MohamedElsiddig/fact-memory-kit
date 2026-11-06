@@ -93,7 +93,7 @@ ATTR_PATTERNS = [
     # 2.4 GHz
     ("clock", re.compile(r"\b(\d+(?:\.\d+)?)\s*ghz\b")),
     # port 8080 / port=8080 / :8080
-    ("port", re.compile(r"\bport\s*[=:]?\s*(\d{2,5})\b")),
+    ("port", re.compile(r"\bport\s*[=:]?\s*(\d{2,5}(?:\s*-\s*\d{2,5})?)")),
     ("port", re.compile(r"(?<![\d.]):(\d{2,5})\b")),
     # 10.0.0.5
     ("ip", re.compile(r"\b(\d{1,3}(?:\.\d{1,3}){3})\b")),
@@ -137,14 +137,26 @@ def _value_conflict(a: dict, b: dict, shared=()) -> list[tuple[str, set, set]]:
     aa, ab = _attributes(a["content"]), _attributes(b["content"])
     out = []
     for k in set(aa) & set(ab):
-        if aa[k] == ab[k]:
-            continue
         # A bare port or IP is only a conflict when both facts are about the
         # same declared subject; otherwise two services may legitimately differ.
         if k in GENERIC_ATTRS and not shared:
             continue
+        # Values are compared canonically, so 16GB vs 16384MB or 3.6GHz vs
+        # 3600MHz are agreement, not a conflict.
+        differing = [v for v in aa[k] if not any(_same(k, v, w) for w in ab[k])]
+        differing_b = [w for w in ab[k] if not any(_same(k, w, v) for v in aa[k])]
+        if not differing and not differing_b:
+            continue
         out.append((k, aa[k], ab[k]))
     return out
+
+
+def _same(attr: str, a: str, b: str) -> bool:
+    try:
+        from .units import conflicts
+        return not conflicts(attr, a, b)
+    except Exception:  # noqa: BLE001 - never let unit parsing break detection
+        return str(a).strip().lower() == str(b).strip().lower()
 
 
 def find_conflicts(db_path: str | Path, overlap_min: float = 0.35,

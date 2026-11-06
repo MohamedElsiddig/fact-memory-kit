@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import sys
@@ -30,6 +31,36 @@ def _embedder(cfg: Config) -> EmbeddingClient:
 
 def _print_json(payload) -> None:
     print(json.dumps(payload, indent=1, ensure_ascii=False, default=str))
+
+
+# files vendored into the Hermes plugin: installed name -> repo source
+_PLUGIN_FILES = (
+    ("__init__.py", "integrations/hermes/factkit/plugin_init.py"),
+    ("plugin.yaml", "integrations/hermes/factkit/plugin.yaml"),
+    ("factkit/config.py", "factkit/config.py"),
+    ("factkit/embed.py", "factkit/embed.py"),
+    ("factkit/vectors.py", "factkit/vectors.py"),
+    ("factkit/holo.py", "factkit/holo.py"),
+)
+
+
+def _sha256(path: Path) -> str | None:
+    try:
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+    except OSError:
+        return None
+
+
+def _plugin_version(manifest: Path) -> str:
+    try:
+        text = manifest.read_text(encoding="utf-8")
+    except OSError:
+        return "unknown"
+    for line in text.splitlines():
+        key, sep, value = line.partition(":")
+        if sep and key.strip() == "version":
+            return value.strip().strip("'\"") or "unknown"
+    return "unknown"
 
 
 def index_embeddings(store: Store, cfg: Config, *, batch_report: bool = True,
@@ -410,6 +441,68 @@ def cmd_doctor(args) -> int:
     return 0
 
 
+def cmd_plugin_status(args) -> int:
+    """Compare the installed Hermes plugin with this checkout."""
+    plugins = Path(os.environ.get("HERMES_PLUGINS") or
+                   (Path.home() / ".hermes" / "plugins")).expanduser()
+    installed = plugins / "factkit"
+    repo = Path(__file__).resolve().parent.parent
+
+    if not (installed / "plugin.yaml").is_file():
+        message = (f"factkit plugin not installed at {installed} "
+                   f"(run integrations/hermes/factkit/install.sh)")
+        if args.json:
+            _print_json({"installed": False, "installed_path": str(installed),
+                         "repo_root": str(repo), "error": message})
+        else:
+            print(f"error: {message}", file=sys.stderr)
+        return 2
+
+    rows = []
+    for name, rel in _PLUGIN_FILES:
+        repo_path = repo / rel
+        inst_path = installed / name
+        repo_sha = _sha256(repo_path)
+        inst_sha = _sha256(inst_path)
+        if repo_sha is None:
+            status = "missing-source"
+        elif inst_sha is None:
+            status = "missing"
+        elif repo_sha == inst_sha:
+            status = "match"
+        else:
+            status = "drift"
+        rows.append({
+            "name": name,
+            "repo_path": str(repo_path),
+            "installed_path": str(inst_path),
+            "repo_sha256": repo_sha,
+            "installed_sha256": inst_sha,
+            "status": status,
+        })
+
+    drift = any(row["status"] != "match" for row in rows)
+    verdict = "DRIFT" if drift else "MATCH"
+    version = _plugin_version(installed / "plugin.yaml")
+
+    if args.json:
+        _print_json({"installed": True, "installed_path": str(installed),
+                     "repo_root": str(repo), "version": version,
+                     "verdict": verdict, "files": rows})
+    else:
+        print(f"plugin   {installed}")
+        print(f"version  {version}")
+        print(f"repo     {repo}")
+        print()
+        print(f"{'file':<20} {'repo sha256':<64} {'installed sha256':<64} status")
+        for row in rows:
+            print(f"{row['name']:<20} {row['repo_sha256'] or '-':<64} "
+                  f"{row['installed_sha256'] or '-':<64} {row['status']}")
+        print()
+        print(f"verdict  {verdict}")
+    return 1 if drift else 0
+
+
 # ----------------------------------------------------------------------- parser
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
@@ -601,6 +694,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("doctor", help="environment and embedding health")
     p.set_defaults(func=cmd_doctor)
+
+    p = sub.add_parser("plugin-status",
+                       help="compare the installed Hermes plugin with this checkout")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_plugin_status)
     return parser
 
 
@@ -660,3 +758,7 @@ def cmd_prefetch(args) -> int:
     store = holo.load_plugin_store(args.db)
     print(json.dumps(holo.prefetch(store, args.message, limit=args.limit), indent=2))
     return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
