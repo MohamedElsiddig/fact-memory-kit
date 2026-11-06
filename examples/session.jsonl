@@ -1,0 +1,4 @@
+{"role": "user", "content": "For the record, my Atlas Server runs Debian at 192.0.2.10 and has 16 GB of RAM."}
+{"role": "assistant", "content": "Noted."}
+{"role": "user", "content": "I prefer short bullet answers over long prose, and always give me the command first."}
+{"role": "user", "content": "Can you check whether proxy is running?"}

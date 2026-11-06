@@ -1,0 +1,42 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e . pytest
+      - name: unit + integration tests
+        run: pytest -q
+      - name: golden gate smoke (offline, demo corpus)
+        run: |
+          export FACTKIT_DB="$RUNNER_TEMP/facts.db"
+          factkit init --demo
+          factkit golden-write
+          factkit gate --no-vectors
+          factkit conflicts scan
+          factkit ttl scan
+          factkit report --json
+      - name: cli smoke
+        run: |
+          export FACTKIT_DB="$RUNNER_TEMP/facts.db"
+          factkit search "pi 5" --no-vectors --json
+          factkit capture "My laptop has 48 GB RAM"
+          factkit route "what are my laptop specs"
+          factkit export --format csv --out "$RUNNER_TEMP/facts.csv"
+          factkit import "$RUNNER_TEMP/facts.csv" --dry-run

@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+build/
+dist/
+*.egg-info/
+
+# Local databases and generated sets (per-corpus, never commit)
+*.db
+*.db-wal
+*.db-shm
+golden.json
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/

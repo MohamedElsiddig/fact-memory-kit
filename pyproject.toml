@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "factkit"
+version = "0.1.0"
+description = "Local-first fact memory: hybrid retrieval, conflict detection, TTL, audit, capture, routing and metrics over SQLite."
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "MIT"}
+authors = [{name = "Mohamed Elsiddig"}]
+keywords = ["memory", "rag", "sqlite", "embeddings", "bm25", "agents"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: OS Independent",
+]
+
+[project.optional-dependencies]
+fast = ["numpy>=1.24"]
+dev = ["pytest>=7.4"]
+
+[project.scripts]
+factkit = "factkit.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["factkit*"]

@@ -1,0 +1,8 @@
+{
+ "thresholds": {"r_at_5": 0.85, "mrr": 0.8, "fp": 0, "hit_rate": 0.9},
+ "cases": [
+  {"q": "transcriber port 8010", "facts": [94], "kind": "lexical"},
+  {"q": "how do I send mail from the terminal", "facts": [77], "kind": "paraphrase"},
+  {"q": "kubernetes helm chart registry", "facts": [], "kind": "negative", "note": "must return nothing"}
+ ]
+}
