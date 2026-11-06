@@ -191,3 +191,106 @@ def import_hermes(store, hermes_db: Path, *, dry_run: bool = False,
     return {"source": str(hermes_db), "rows": len(rows), "added": len(added),
             "skipped": len(skipped), "errors": errors, "dry_run": dry_run,
             "detail": added[:50]}
+
+
+def sync_hermes(store, hermes_db: Path, *, dry_run: bool = False,
+                prune: bool = False) -> dict:
+    """Keep the factkit store aligned with a live Hermes ``memory_store.db``.
+
+    Hermes stays the source of truth. This mirrors inserts, updates changed text
+    in place (so fact_id and its embeddings survive), and optionally retires facts
+    deleted upstream. The source is opened read-only.
+    """
+    hermes_db = Path(hermes_db).expanduser()
+    con = sqlite3.connect(f"file:{hermes_db}?mode=ro", uri=True, timeout=5.0)
+    con.row_factory = sqlite3.Row
+    try:
+        rows = [dict(r) for r in con.execute(
+            "SELECT fact_id, content, category, tags, trust_score, created_at, updated_at "
+            "FROM facts ORDER BY fact_id")]
+        links: dict[int, list[str]] = {}
+        tables = {r[0] for r in con.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'")}
+        if {"fact_entities", "entities"} <= tables:
+            for r in con.execute(
+                    "SELECT fe.fact_id, e.name FROM fact_entities fe "
+                    "JOIN entities e ON e.entity_id=fe.entity_id"):
+                links.setdefault(int(r["fact_id"]), []).append(r["name"])
+    finally:
+        con.close()
+
+    mapping = {int(r["hermes_id"]): int(r["fact_id"]) for r in store.db.execute(
+        "SELECT hermes_id, fact_id FROM hermes_map")}
+    by_content = {" ".join(f["content"].lower().split()): f["fact_id"]
+                  for f in store.list_facts(limit=1_000_000)}
+    added = updated = unchanged = 0
+    details: list[dict] = []
+    seen_hermes: set[int] = set()
+
+    for row in rows:
+        hid = int(row["fact_id"])
+        seen_hermes.add(hid)
+        content = " ".join((row["content"] or "").split())
+        if not content:
+            continue
+        fact_id = mapping.get(hid) or by_content.get(content.lower())
+        if fact_id and store.get(fact_id) is None:
+            fact_id = None
+        if fact_id is None:
+            if dry_run:
+                added += 1
+                details.append({"hermes_id": hid, "action": "add"})
+                continue
+            fact = store.add_fact(
+                content, category=row.get("category") or "general",
+                tags=row.get("tags") or "", trust_score=float(row.get("trust_score") or 0.5),
+                source="hermes-sync", actor="sync",
+                reason=f"hermes fact #{hid}")
+            fact_id = fact["fact_id"]
+            store.db.execute(
+                "INSERT OR REPLACE INTO hermes_map(hermes_id, fact_id) VALUES (?,?)",
+                (hid, fact_id))
+            if row.get("created_at"):
+                store.db.execute(
+                    "UPDATE facts SET created_at=?, updated_at=? WHERE fact_id=?",
+                    (row["created_at"], row.get("updated_at") or row["created_at"], fact_id))
+            for name in links.get(hid, []):
+                store.link_entity(fact_id, store.ensure_entity(name))
+            by_content[content.lower()] = fact_id
+            added += 1
+            details.append({"hermes_id": hid, "action": "add", "fact_id": fact_id})
+            continue
+
+        current = store.get(fact_id)
+        if current["content"].strip() != content:
+            if not dry_run:
+                store.update_fact(fact_id, content=content,
+                                  category=row.get("category") or current["category"],
+                                  tags=row.get("tags") or current["tags"],
+                                  reason=f"synced from hermes #{hid}")
+                if row.get("updated_at"):
+                    store.db.execute("UPDATE facts SET updated_at=? WHERE fact_id=?",
+                                     (row["updated_at"], fact_id))
+            updated += 1
+            details.append({"hermes_id": hid, "action": "update", "fact_id": fact_id})
+        else:
+            unchanged += 1
+        if not dry_run:
+            store.db.execute(
+                "INSERT OR REPLACE INTO hermes_map(hermes_id, fact_id) VALUES (?,?)",
+                (hid, fact_id))
+
+    pruned = 0
+    if prune:
+        for hid, fact_id in mapping.items():
+            if hid not in seen_hermes and store.get(fact_id) is not None:
+                pruned += 1
+                details.append({"hermes_id": hid, "action": "prune", "fact_id": fact_id})
+                if not dry_run:
+                    store.remove_fact(fact_id, actor="sync",
+                                      reason=f"deleted in Hermes (#{hid})")
+    if not dry_run:
+        store.db.commit()
+    return {"source": str(hermes_db), "source_facts": len(rows), "added": added,
+            "updated": updated, "unchanged": unchanged, "pruned": pruned,
+            "dry_run": dry_run, "detail": details[:60]}

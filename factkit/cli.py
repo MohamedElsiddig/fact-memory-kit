@@ -576,6 +576,13 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--alias")
     p.set_defaults(func=cmd_entity)
 
+    p = sub.add_parser("sync", help="mirror a Hermes memory_store.db into factkit")
+    p.add_argument("--hermes", required=True, metavar="MEMORY_DB")
+    p.add_argument("--dry-run", action="store_true")
+    p.add_argument("--prune", action="store_true", help="retire facts deleted upstream")
+    p.add_argument("--no-embed", action="store_true")
+    p.set_defaults(func=cmd_sync)
+
     p = sub.add_parser("doctor", help="environment and embedding health")
     p.set_defaults(func=cmd_doctor)
     return parser
@@ -592,3 +599,16 @@ def main(argv=None) -> int:
     except Exception as exc:  # noqa: BLE001
         print(f"error: {exc}", file=sys.stderr)
         return 1
+
+
+def cmd_sync(args) -> int:
+    store, cfg = _store(args), _cfg(args)
+    result = bulk.sync_hermes(store, Path(args.hermes), dry_run=args.dry_run,
+                              prune=args.prune)
+    _print_json({k: v for k, v in result.items() if k != "detail"})
+    if not args.dry_run and (result["added"] or result["updated"]) and not args.no_embed:
+        try:
+            index_embeddings(store, cfg)
+        except SystemExit as exc:
+            print(f"warning: {exc}", file=sys.stderr)
+    return 0
