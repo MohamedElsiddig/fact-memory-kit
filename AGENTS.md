@@ -3,6 +3,26 @@
 You are an agent with shell access. This file is your operating manual for
 `fact-memory-kit`. Follow it instead of inventing a workflow.
 
+## 0. Pick the mode
+
+**Companion (default).** If the host already runs Hermes holographic memory,
+`~/.hermes/memory_store.db` is the authoritative store. Do not create a second
+database and do not edit the provider. Install the plugin and point factkit at
+that file:
+
+```bash
+bash integrations/hermes/factkit/install.sh
+hermes plugins enable factkit
+export FACTKIT_DB=~/.hermes/memory_store.db
+factkit embed
+```
+
+Maintenance then runs against the live store, and every write goes through the
+provider's `MemoryStore` API (see section 8).
+
+**Standalone.** Only when there is no existing store, or for a separate corpus:
+use `factkit init` and the default `~/.factkit/facts.db`.
+
 ## 1. Install (one time)
 
 ```bash
@@ -10,7 +30,7 @@ git clone https://github.com/MohamedElsiddig/fact-memory-kit.git
 cd fact-memory-kit
 python3 -m venv .venv
 .venv/bin/pip install -e .
-.venv/bin/factkit init
+.venv/bin/factkit init          # standalone mode only
 ```
 
 Add `.venv/bin` to `PATH`, or call `.venv/bin/factkit` explicitly. The only
