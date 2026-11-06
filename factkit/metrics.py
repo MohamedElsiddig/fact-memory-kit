@@ -35,6 +35,10 @@ def render_text(data: dict) -> str:
     lines = [
         f"factkit report  ({data['generated_at']})",
         "-" * 46,
+    ]
+    if data.get("database"):
+        lines.append(f"database           {data['database']['label']}")
+    lines += [
         f"facts              {data['facts']}",
         f"entities           {data['entities']}",
         f"embedding coverage {data['embeddings']['coverage']:.0%}",
@@ -62,6 +66,8 @@ def render_html(data: dict) -> str:
         f"<td>{m['dims']}</td><td>{html.escape(str(m['last']))}</td></tr>"
         for m in data["embeddings"]["models"])
     retrieval = data["retrieval"]
+    db_line = (f'<p class="muted">database: {html.escape(data["database"]["label"])}</p>'
+               if data.get("database") else "")
     return f"""<!doctype html>
 <html><head><meta charset="utf-8"><title>factkit dashboard</title>
 <style>
@@ -72,6 +78,7 @@ td,th{{padding:.35rem .8rem;border-bottom:1px solid #e5e5e5;text-align:left}}
 .grid{{display:flex;gap:2.5rem;flex-wrap:wrap}}
 </style></head><body>
 <h1>factkit — {html.escape(data['generated_at'])}</h1>
+{db_line}
 <div class="grid">
   <div><div class="big">{data['facts']}</div><div class="muted">facts</div></div>
   <div><div class="big">{data['entities']}</div><div class="muted">entities</div></div>

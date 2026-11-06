@@ -31,7 +31,7 @@ plugins="${HERMES_PLUGINS:-$HOME/.hermes/plugins}"
 dest="$plugins/factkit"
 
 # vendored files: installed path -> repo source
-labels=(__init__.py plugin.yaml factkit/config.py factkit/embed.py factkit/vectors.py factkit/units.py factkit/maintenance.py factkit/holo.py)
+labels=(__init__.py plugin.yaml factkit/config.py factkit/embed.py factkit/vectors.py factkit/units.py factkit/maintenance.py factkit/embedcache.py factkit/holo.py)
 sources=(
   "$here/plugin_init.py"
   "$here/plugin.yaml"
@@ -39,6 +39,7 @@ sources=(
   "$repo/factkit/embed.py"
   "$repo/factkit/vectors.py"
   "$repo/factkit/units.py"
+  "$repo/factkit/embedcache.py"
   "$repo/factkit/maintenance.py"
   "$repo/factkit/holo.py"
 )
@@ -49,6 +50,7 @@ targets=(
   "$dest/factkit/embed.py"
   "$dest/factkit/vectors.py"
   "$dest/factkit/units.py"
+  "$dest/factkit/embedcache.py"
   "$dest/factkit/maintenance.py"
   "$dest/factkit/holo.py"
 )

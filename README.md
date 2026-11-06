@@ -254,10 +254,13 @@ Plugin-only keys (`config.yaml`, env overrides in brackets): `prefetch`
 
 ## Standalone extras
 
-These act on factkit's own store, not on the holographic database:
+These act on factkit's own store unless noted (the dashboard can also serve the
+live Hermes store, read-only):
 
 - `factkit dashboard --host 127.0.0.1 --port 8765 --token ...` — metrics plus
-  accept/reject queues; bearer token and HttpOnly cookie when `--token` is set
+  accept/reject queues; bearer token and HttpOnly cookie when `--token` is set.
+  Shows the live Hermes store (`~/.hermes/memory_store.db`) read-only by
+  default; see [Dashboard database](#dashboard-database).
 - `factkit review` — curses queue, `--line` for dumb terminals
 - `factkit bridge <file|state.db>` — propose facts from a transcript or a Hermes
   session DB
@@ -265,6 +268,32 @@ These act on factkit's own store, not on the holographic database:
 - `factkit import --hermes ~/.hermes/memory_store.db` — read-only snapshot import
 - `factkit sync --hermes ~/.hermes/memory_store.db` — mirror changes one way
 - `factkit route`, `factkit capture`, `factkit report`, `factkit audit`
+
+## Dashboard database
+
+`factkit dashboard` picks its database explicitly and labels it in the page and
+in `/api/summary` (`database.path`, `.mode`, `.readonly`, `.label`):
+
+| setting | values | default |
+|---|---|---|
+| `--db` / `FACTKIT_DB` | any SQLite path | live default below |
+| `FACTKIT_DB_MODE` / `--mode` | `live`, `corpus` | `live` |
+| `FACTKIT_READONLY` / `--read-only` | truthy / flag | off (corpus only) |
+
+Defaults: `live` is `~/.hermes/memory_store.db`; `corpus` is
+`~/.factkit/facts.db`; an explicit path infers `live` only when it resolves to
+the live file. Precedence is `--db` > `FACTKIT_DB` > the mode's default.
+
+The live store is **always read-only**: it is opened with SQLite `mode=ro` and
+`PRAGMA query_only=ON`, and the server answers review POSTs with `403`. There
+is no flag that opens `~/.hermes/memory_store.db` read-write. Review actions
+are available only on a corpus database, or on a custom path passed to `--db`.
+
+```bash
+factkit dashboard                                   # live store, read-only
+factkit dashboard --mode corpus                     # factkit's own store
+factkit dashboard --db ~/scratch/facts.db --read-only
+```
 
 ## Safety guarantees
 

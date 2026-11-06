@@ -113,7 +113,7 @@ class HybridSearch:
         hits.sort(key=lambda h: (-h.score, h.fact_id))
         hits = hits[:k]
 
-        if log:
+        if log and not getattr(self.store, "readonly", False):
             ms = (time.perf_counter() - started) * 1000
             self.store.metric("search", "latency_ms", ms, vector=bool(qvec), k=k)
             self.store.metric("search", "hit", 1.0 if hits else 0.0, q=query[:120])

@@ -160,8 +160,21 @@ def _json(value: Any) -> str:
 
 
 class Store:
-    def __init__(self, path: str | Path, *, init: bool = True):
+    def __init__(self, path: str | Path, *, init: bool = True, readonly: bool = False):
         self.path = Path(path).expanduser()
+        self.readonly = bool(readonly)
+        if self.readonly:
+            # Never create, never migrate, never write. SQLite enforces this at
+            # the file level; PRAGMA query_only is a second belt for the same
+            # connection.
+            if not self.path.exists():
+                raise FileNotFoundError(f"database not found: {self.path}")
+            uri = f"file:{self.path}?mode=ro"
+            self.db = sqlite3.connect(uri, uri=True, timeout=10.0)
+            self.db.row_factory = sqlite3.Row
+            self.db.execute("PRAGMA query_only=ON")
+            self.db.execute("SELECT COUNT(*) FROM facts").fetchone()  # prove it reads
+            return
         if init:
             self.path.parent.mkdir(parents=True, exist_ok=True)
         self.db = sqlite3.connect(self.path, timeout=10.0)
@@ -367,8 +380,13 @@ class Store:
             (alias.strip(), entity_id))
 
     def entities(self) -> list[dict]:
+        # factkit's schema calls it ``kind``; the live Hermes store calls it
+        # ``entity_type``. Read either, so the dashboard can serve both.
+        columns = {row["name"] for row in self.db.execute("PRAGMA table_info(entities)")}
+        kind = ("e.entity_type" if "entity_type" in columns
+                else "e.kind" if "kind" in columns else "'thing'")
         rows = self.db.execute(
-            "SELECT e.entity_id, e.name, e.kind, COUNT(fe.fact_id) n "
+            f"SELECT e.entity_id, e.name, {kind} AS kind, COUNT(fe.fact_id) n "
             "FROM entities e LEFT JOIN fact_entities fe ON fe.entity_id=e.entity_id "
             "GROUP BY e.entity_id ORDER BY n DESC, e.name")
         return [dict(r) for r in rows]

@@ -401,9 +401,18 @@ def cmd_report(args) -> int:
 
 
 def cmd_dashboard(args) -> int:
+    from .config import resolve_dashboard_db
     from .server import serve
     token = args.token or os.environ.get("FACTKIT_DASHBOARD_TOKEN", "")
-    serve(_store(args), host=args.host, port=args.port, token=token)
+    readonly = None
+    if getattr(args, "read_only", False):
+        readonly = True
+    elif getattr(args, "read_write", False):
+        readonly = False
+    selection = resolve_dashboard_db(getattr(args, "db", None),
+                                     mode=getattr(args, "mode", None),
+                                     readonly=readonly)
+    serve(selection, host=args.host, port=args.port, token=token)
     return 0
 
 
@@ -658,6 +667,15 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("dashboard", help="serve the review dashboard")
     p.add_argument("--host", default="127.0.0.1")
     p.add_argument("--port", type=int, default=8765)
+    p.add_argument("--db", default=argparse.SUPPRESS,
+                   help="SQLite file to show (default: live ~/.hermes/memory_store.db)")
+    p.add_argument("--mode", choices=("live", "corpus"), default=None,
+                   help="database role (default: live; corpus = factkit's own store)")
+    access = p.add_mutually_exclusive_group()
+    access.add_argument("--read-only", action="store_true",
+                        help="refuse review actions (implied for a live database)")
+    access.add_argument("--read-write", action="store_true",
+                        help="allow review actions on a corpus database (never on live)")
     p.add_argument("--token", default="",
                    help="require this bearer token (or FACTKIT_DASHBOARD_TOKEN)")
     p.set_defaults(func=cmd_dashboard)
@@ -671,7 +689,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("holo", help="maintain the live holographic memory store")
     p.add_argument("action", choices=["conflicts", "stale", "dupes", "maintain",
-                                      "undo", "tombstones", "purge", "guard"])
+                                      "undo", "tombstones", "purge", "guard",
+                                      "decay", "provenance", "prose", "metrics"])
     p.add_argument("--db", default=str(Path.home() / ".hermes" / "memory_store.db"))
     p.add_argument("--apply", action="store_true", help="write changes (default: report only)")
     p.add_argument("--days", type=int, default=90)
@@ -681,6 +700,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--adjudicate", action="store_true",
                    help="ask the local LLM to judge prose contradictions (proposals only)")
     p.add_argument("--llm-model", default=None, help="override the adjudicator model")
+    p.add_argument("--llm-url", default=None, metavar="URL",
+                   help="override the adjudicator base URL (e.g. https://llm.local/v1)")
     p.add_argument("--auto", action="store_true", help="allow the policy's auto-apply class")
     p.add_argument("--limit", type=int, default=None, help="cap applied changes in this run")
     p.add_argument("--smoke", metavar="JSON", default=None,
@@ -806,6 +827,48 @@ def cmd_holo(args) -> int:
         removed = maintenance.purge_tombstones(store, days=args.days)
         _print_json({"db": args.db, "purged": removed, "days": args.days})
         return 0
+    if action == "decay":
+        from . import decay
+        out = decay.scan(store, limit=args.limit or 0)
+        _print_json({"db": args.db, **out})
+        return 0
+    if action == "provenance":
+        from . import provenance
+        provenance.ensure_schema(store)
+        diff = provenance.snapshot_diff(store)
+        backfilled = 0
+        if diff.get("new") and args.apply:
+            backfilled = provenance.backfill(store).get("inserted", 0)
+            diff = provenance.snapshot_diff(store)
+        _print_json({"db": args.db, "backfilled": backfilled, "diff": diff,
+                     "report": provenance.report(store)})
+        return 0
+    if action == "prose":
+        from . import adjudicate, prose
+        from .config import Config
+        cfg = Config.load(args.db)
+        if args.llm_url:
+            cfg.llm_base_url = args.llm_url.rstrip("/")
+        if args.llm_model:
+            cfg.llm_model = args.llm_model
+        out = prose.prose_scan(
+            store, lambda prompt: adjudicate._post(cfg, prompt),
+            max_pairs=args.limit or 50, apply_proposals=args.apply)
+        _print_json({"db": args.db, **out})
+        return 0
+    if action == "metrics":
+        from . import live_metrics
+        from .config import Config
+        from .embed import from_config
+        path = args.smoke or "examples/smoke_cases.json"
+        cases = live_metrics.load_cases(path, store)
+        embedder = None
+        if cases:
+            embedder = from_config(Config.load(args.db))
+        result = live_metrics.evaluate(store, cases, k=args.limit or 5, embedder=embedder)
+        verdict = live_metrics.gate(result)
+        _print_json({"db": args.db, "cases": path, **result, "gate": verdict})
+        return 0 if verdict["ok"] else 1
     if action == "guard":
         from . import guard
         if not args.text:

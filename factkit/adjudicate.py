@@ -38,10 +38,13 @@ def _post(cfg, prompt: str, timeout: float = 60.0) -> str:
         "temperature": 0,
         "max_tokens": 200,
     }).encode()
+    # A single local gateway usually serves both embeddings and chat; reuse the
+    # embedding token when no separate chat key is configured.
+    token = cfg.llm_api_key or getattr(cfg, "embed_api_key", "")
     req = urllib.request.Request(
         f"{cfg.llm_base_url.rstrip('/')}/chat/completions", data=body,
         headers={"Content-Type": "application/json",
-                 **({"Authorization": f"Bearer {cfg.llm_api_key}"} if cfg.llm_api_key else {})},
+                 **({"Authorization": f"Bearer {token}"} if token else {})},
         method="POST")
     with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310
         payload = json.loads(resp.read())
