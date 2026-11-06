@@ -25,6 +25,77 @@ PLUGIN_DIR = Path.home() / ".hermes" / "plugins" / "holographic"
 
 
 # --------------------------------------------------------------------- store
+class ReadOnlyStore:
+    """Read-only view of a store, for callers that cannot take a write lock.
+
+    The gateway's plugin host can refuse a write-open of the live file, so the
+    recall path opens it read-only. A WAL database still needs its -shm/-wal
+    side files, which may also be off limits; in that case the database and its
+    side files are copied to a private snapshot and read from there. Snapshots
+    are cached by (mtime, size) so a turn does not re-copy the file.
+    """
+
+    _snapshots: dict = {}
+
+    def __init__(self, db_path: str | Path):
+        self.db_path = str(Path(db_path).expanduser())
+        try:
+            self._conn = self._open_direct(self.db_path)
+        except sqlite3.OperationalError:
+            self._conn = self._open_snapshot(self.db_path)
+        self._conn.row_factory = sqlite3.Row
+
+    @staticmethod
+    def _open_direct(path: str) -> sqlite3.Connection:
+        conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, check_same_thread=False)
+        conn.execute("SELECT COUNT(*) FROM facts").fetchone()   # prove it reads
+        return conn
+
+    @classmethod
+    def _open_snapshot(cls, path: str) -> sqlite3.Connection:
+        import shutil
+        import tempfile
+        import time
+
+        source = Path(path)
+        stamp = (str(source), source.stat().st_mtime_ns, source.stat().st_size)
+        cached = cls._snapshots.get(stamp)
+        if cached:
+            return sqlite3.connect(cached, check_same_thread=False)
+
+        target_dir = Path(tempfile.mkdtemp(prefix="factkit-ro-"))
+        target = target_dir / source.name
+        shutil.copy2(source, target)
+        for suffix in ("-wal", "-shm"):
+            side = source.with_name(source.name + suffix)
+            if side.exists():
+                try:
+                    shutil.copy2(side, target.with_name(target.name + suffix))
+                except OSError:
+                    pass
+        conn = sqlite3.connect(str(target), check_same_thread=False)
+        conn.execute("SELECT COUNT(*) FROM facts").fetchone()
+
+        # keep the cache small; snapshots are per-process and disposable
+        for old, _ in list(cls._snapshots.items())[:-2]:
+            cls._snapshots.pop(old, None)
+        for stale in target_dir.parent.glob("factkit-ro-*"):
+            try:
+                if stale != target_dir and time.time() - stale.stat().st_mtime > 3600:
+                    shutil.rmtree(stale, ignore_errors=True)
+            except OSError:
+                pass
+        cls._snapshots[stamp] = str(target)
+        return conn
+
+    def read(self, sql: str, params=()) -> list[dict]:
+        return [dict(r) for r in self._conn.execute(sql, params)]
+
+    def count_facts(self) -> int:
+        row = self._conn.execute("SELECT COUNT(*) AS n FROM facts").fetchone()
+        return int(row["n"] if row else 0)
+
+
 def load_plugin_store(db_path: str | Path | None = None):
     """Import the holographic plugin's MemoryStore without running its __init__."""
     if "holographic" not in sys.modules:
