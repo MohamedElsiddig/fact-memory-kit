@@ -670,7 +670,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(func=cmd_entity)
 
     p = sub.add_parser("holo", help="maintain the live holographic memory store")
-    p.add_argument("action", choices=["conflicts", "stale", "dupes"])
+    p.add_argument("action", choices=["conflicts", "stale", "dupes", "maintain",
+                                      "undo", "tombstones", "purge"])
     p.add_argument("--db", default=str(Path.home() / ".hermes" / "memory_store.db"))
     p.add_argument("--apply", action="store_true", help="write changes (default: report only)")
     p.add_argument("--days", type=int, default=90)
@@ -680,6 +681,13 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--adjudicate", action="store_true",
                    help="ask the local LLM to judge prose contradictions (proposals only)")
     p.add_argument("--llm-model", default=None, help="override the adjudicator model")
+    p.add_argument("--auto", action="store_true", help="allow the policy's auto-apply class")
+    p.add_argument("--limit", type=int, default=None, help="cap applied changes in this run")
+    p.add_argument("--smoke", metavar="JSON", default=None,
+                   help="smoke cases file; a regression reverts the batch")
+    p.add_argument("--fact-id", type=int, default=None, help="fact id for undo")
+    p.add_argument("--max-ratio", type=float, default=0.20,
+                   help="abort when candidates exceed this fraction of the store")
     p.set_defaults(func=cmd_holo)
 
     p = sub.add_parser("prefetch", help="show semantic recall for a message")
@@ -763,6 +771,38 @@ def cmd_holo(args) -> int:
         _print_json({"db": args.db, "duplicates": len(pairs), "pairs": pairs})
         if args.apply and pairs:
             _print_json({"applied": [holo.apply_merge(store, p, dry_run=False) for p in pairs]})
+        return 0
+    if action == "maintain":
+        from . import policy as policy_mod
+        from . import smoke as smoke_mod
+        pol = policy_mod.Policy(auto=args.auto, max_ratio=args.max_ratio)
+        cases = smoke_mod.load_cases(args.smoke) if args.smoke else None
+        result = holo.maintain(store, policy=pol, dry_run=not args.apply,
+                              limit=args.limit, smoke_cases=cases)
+        _print_json(result)
+        if result.get("aborted"):
+            return 2
+        return 0
+    if action == "undo":
+        from . import maintenance
+        if args.fact_id is None:
+            raise SystemExit("undo needs --fact-id")
+        if not args.apply:
+            row = maintenance.list_tombstones(store, include_restored=True)
+            match = [r for r in row if int(r["fact_id"]) == args.fact_id]
+            _print_json({"dry_run": True, "tombstone": match[0] if match else None})
+            return 0 if match else 1
+        _print_json(maintenance.restore_fact(store, args.fact_id))
+        return 0
+    if action == "tombstones":
+        from . import maintenance
+        rows = maintenance.list_tombstones(store, include_restored=args.apply)
+        _print_json({"db": args.db, "tombstones": len(rows), "rows": rows})
+        return 0
+    if action == "purge":
+        from . import maintenance
+        removed = maintenance.purge_tombstones(store, days=args.days)
+        _print_json({"db": args.db, "purged": removed, "days": args.days})
         return 0
     raise SystemExit(f"unknown action {action}")
 

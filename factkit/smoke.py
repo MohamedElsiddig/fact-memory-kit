@@ -68,7 +68,7 @@ def _hit_ids(hits, top_k: int) -> list[int]:
         fid = hit.get("fact_id") if isinstance(hit, dict) else getattr(hit, "fact_id", None)
         if isinstance(fid, bool) or not isinstance(fid, int):
             try:
-                fid = int(fid)
+                fid = int(str(fid))          # tolerate numeric strings
             except (TypeError, ValueError):
                 continue
         out.append(fid)

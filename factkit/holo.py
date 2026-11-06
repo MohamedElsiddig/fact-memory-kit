@@ -25,45 +25,23 @@ PLUGIN_DIR = Path.home() / ".hermes" / "plugins" / "holographic"
 
 
 # --------------------------------------------------------------------- store
-def _install_shims() -> None:
-    """Stand-ins for Hermes runtime helpers when factkit runs outside the gateway."""
-    try:
-        import hermes_state_wal  # noqa: F401
-    except ImportError:
-        mod = types.ModuleType("hermes_state_wal")
-
-        def apply_wal_with_fallback(conn, **_kw):
-            try:
-                conn.execute("PRAGMA journal_mode=WAL")
-            except sqlite3.Error:
-                pass
-
-        mod.apply_wal_with_fallback = apply_wal_with_fallback
-        sys.modules["hermes_state_wal"] = mod
-    try:
-        from hermes_cli.sqlite_util import add_column_if_missing  # noqa: F401
-    except ImportError:
-        pkg = types.ModuleType("hermes_cli")
-        pkg.__path__ = []  # namespace only, no discovery
-        util = types.ModuleType("hermes_cli.sqlite_util")
-
-        def add_column_if_missing(conn, table, column, decl):
-            cols = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
-            if column not in cols:
-                conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
-
-        util.add_column_if_missing = add_column_if_missing
-        sys.modules.setdefault("hermes_cli", pkg)
-        sys.modules["hermes_cli.sqlite_util"] = util
-
-
 def load_plugin_store(db_path: str | Path | None = None):
     """Import the holographic plugin's MemoryStore without running its __init__."""
-    _install_shims()
     if "holographic" not in sys.modules:
         pkg = types.ModuleType("holographic")
         pkg.__path__ = [str(PLUGIN_DIR)]
         sys.modules["holographic"] = pkg
+    try:  # gateway: the real runtime helpers are importable
+        import hermes_state_wal  # noqa: F401
+    except ImportError:  # CLI: install stand-ins before the provider loads
+        try:
+            from . import standalone
+        except ImportError:
+            raise ImportError(
+                "holographic provider needs the Hermes runtime; run this from the "
+                "gateway or from the factkit CLI"
+            )
+        standalone.ensure()
     from holographic.store import MemoryStore  # noqa: WPS433 - deliberate late import
 
     path = str(Path(db_path).expanduser()) if db_path else str(Path.home() / ".hermes" / "memory_store.db")
@@ -152,8 +130,16 @@ def _value_conflict(a: dict, b: dict, shared=()) -> list[tuple[str, set, set]]:
 
 
 def _same(attr: str, a: str, b: str) -> bool:
+    """Equality under unit normalisation.
+
+    Ports and IPs are identity values: on the same declared subject, 7000 and
+    7001 are a disagreement, not two acceptable truths. Capacities, clocks and
+    versions use ``units.conflicts`` so 16GB == 16384MB.
+    """
     try:
-        from .units import conflicts
+        from .units import canonical, conflicts
+        if attr in ("port", "ip"):
+            return canonical(attr, a) == canonical(attr, b)
         return not conflicts(attr, a, b)
     except Exception:  # noqa: BLE001 - never let unit parsing break detection
         return str(a).strip().lower() == str(b).strip().lower()
@@ -189,10 +175,10 @@ def find_conflicts(db_path: str | Path, overlap_min: float = 0.35,
             shared = set(links.get(a["fact_id"], ())) & set(links.get(b["fact_id"], ()))
             if not (jac >= overlap_min or (shared and jac >= entity_min)):
                 continue
-            diffs = _value_conflict(a, b, shared)
+            newer, older = (a, b) if (str(a["updated_at"]), a["fact_id"]) >= (str(b["updated_at"]), b["fact_id"]) else (b, a)
+            diffs = _value_conflict(newer, older, shared)
             if not diffs:
                 continue
-            newer, older = (a, b) if (str(a["updated_at"]), a["fact_id"]) >= (str(b["updated_at"]), b["fact_id"]) else (b, a)
             out.append({
                 "keep": newer["fact_id"], "retire": older["fact_id"],
                 "keep_text": newer["content"], "retire_text": older["content"],
@@ -204,7 +190,7 @@ def find_conflicts(db_path: str | Path, overlap_min: float = 0.35,
 
 
 # ------------------------------------------------------------------ apply
-def apply_conflict(store, pair: dict, *, dry_run: bool = True) -> dict:
+def apply_conflict(store, pair: dict, *, dry_run: bool = True, batch_id: str | None = None) -> dict:
     """Retire the older fact, keeping the newer text as the single truth."""
     keep_id, retire_id = int(pair["keep"]), int(pair["retire"])
     keep = store._one("SELECT fact_id, content, category, tags FROM facts WHERE fact_id = ?", (keep_id,))
@@ -221,7 +207,11 @@ def apply_conflict(store, pair: dict, *, dry_run: bool = True) -> dict:
     # 1. keep the authoritative text (identical => already correct, no touch)
     store.update_fact(keep_id, content=keep["content"], category=keep["category"],
                       tags=keep["tags"], touch=False)
-    # 2. retire the stale one through the plugin's own delete path
+    # 2. tombstone first, so the retirement is undoable even if step 3 fails
+    from . import maintenance
+    maintenance.ensure_tombstones(store)
+    maintenance.tombstone_fact(store, retire_id, reason="conflict", batch_id=batch_id)
+    # 3. retire the stale one through the plugin's own delete path
     store.remove_fact(retire_id)
     # 3. provenance
     with store._tx():
@@ -287,6 +277,13 @@ def merge_duplicates(db_path: str | Path, threshold: float = 0.92) -> list[dict]
             ratio = SequenceMatcher(None, a["content"].lower(), b["content"].lower()).ratio()
             if ratio < threshold:
                 continue
+            # Same sentence with a different number is not a duplicate: "filler
+            # fact 1" and "filler fact 2" score ~0.95 character similarity but
+            # describe different things. Numeric identity is part of the claim.
+            nums_a = set(re.findall(r"\d+(?:\.\d+)?", a["content"]))
+            nums_b = set(re.findall(r"\d+(?:\.\d+)?", b["content"]))
+            if nums_a != nums_b:
+                continue
             keep, drop = sorted([a, b], key=lambda r: (r["trust_score"], r["updated_at"]), reverse=True)
             out.append({"keep": keep["fact_id"], "retire": drop["fact_id"],
                         "ratio": round(ratio, 3), "keep_text": keep["content"],
@@ -294,7 +291,7 @@ def merge_duplicates(db_path: str | Path, threshold: float = 0.92) -> list[dict]
     return out
 
 
-def apply_merge(store, pair: dict, *, dry_run: bool = True) -> dict:
+def apply_merge(store, pair: dict, *, dry_run: bool = True, batch_id: str | None = None) -> dict:
     keep_id, retire_id = int(pair["keep"]), int(pair["retire"])
     if dry_run:
         return {"ok": True, "dry_run": True, "keep": keep_id, "retire": retire_id}
@@ -302,6 +299,9 @@ def apply_merge(store, pair: dict, *, dry_run: bool = True) -> dict:
     retire = store._one("SELECT content FROM facts WHERE fact_id = ?", (retire_id,))
     if keep is None or retire is None:
         return {"ok": False, "reason": "fact disappeared"}
+    from . import maintenance
+    maintenance.ensure_tombstones(store)
+    maintenance.tombstone_fact(store, retire_id, reason="duplicate", batch_id=batch_id)
     store.remove_fact(retire_id)
     with store._tx():
         store._write("INSERT INTO audit(action, fact_id, actor, reason, before, after) VALUES (?,?,?,?,?,?)",
@@ -456,3 +456,123 @@ def fuse_results(store, query: str, provider_facts: list[dict], *,
     return (ordered[:keep] + reserve)[:limit] if limit else ordered + reserve
 
 
+
+
+# ------------------------------------------------------- maintenance batches
+def _enrich(store, pair: dict) -> dict:
+    """Attach the fact metadata the policy engine needs."""
+    out = dict(pair)
+    cols = {r[1] for r in store._conn.execute("PRAGMA table_info(facts)")}
+    source = "source" if "source" in cols else "NULL AS source"
+    for side in ("keep", "retire"):
+        row = store._one(f"SELECT category, trust_score, {source} FROM facts WHERE fact_id = ?",
+                         (int(pair[side]),))
+        if row is not None:
+            out[f"{side}_category"] = row["category"]
+            out[f"{side}_trust"] = row["trust_score"]
+            out[f"{side}_source"] = row["source"]
+    return out
+
+
+def _record_proposal(store, pair: dict, status: str, batch_id: str | None) -> None:
+    from . import maintenance
+    maintenance.ensure_tombstones(store)   # keeps schema creation in one place
+    diffs = pair.get("diffs") or []
+    slots = ",".join(str(d.get("slot", "")) for d in diffs) or "duplicate"
+    delta = " | ".join(f"{d.get('slot')}: {d.get('keep')} vs {d.get('retire')}" for d in diffs) or "same content"
+    with store._tx():
+        store._write(
+            "INSERT OR IGNORE INTO conflict_proposals"
+            "(keep_id, retire_id, jaccard, slots, delta, status, note) VALUES (?,?,?,?,?,?,?)",
+            (int(pair["keep"]), int(pair["retire"]), float(pair.get("jaccard") or pair.get("ratio") or 0.0),
+             slots, delta, status, f"batch={batch_id}" if batch_id else ""))
+
+
+def maintain(store, *, policy=None, dry_run: bool = True, limit: int | None = None,
+             smoke_cases: list[dict] | None = None, batch_id: str | None = None,
+             apply_fn=None) -> dict:
+    """Classify candidates and (optionally) apply the auto class under limits.
+
+    Nothing is written to ``facts`` unless ``dry_run`` is False AND the policy
+    allows the auto class. Every retirement is tombstoned first, so a batch can
+    be reverted with :func:`factkit.maintenance.restore_fact`.
+    """
+    import datetime as _dt
+    import uuid as _uuid
+
+    from . import maintenance, policy as policy_mod, smoke as smoke_mod
+
+    policy = policy or policy_mod.Policy()
+    batch_id = batch_id or _dt.datetime.now().strftime("b%Y%m%d%H%M%S") + "-" + _uuid.uuid4().hex[:6]
+    db = store.db_path
+    conflicts = [_enrich(store, p) for p in find_conflicts(db)]
+    dupes = []
+    for p in merge_duplicates(db):
+        p = dict(p)
+        p["kind"] = "duplicate"
+        dupes.append(_enrich(store, p))
+
+    total = store.count_facts()
+    candidates = conflicts + dupes
+    summary = {"batch": batch_id, "dry_run": dry_run, "scanned": total,
+               "candidates": len(candidates), "auto": 0, "proposed": 0,
+               "never": 0, "applied": 0, "aborted": None, "reverted": False,
+               "smoke_before": None, "smoke_after": None}
+
+    budget = policy.max_apply if limit is None else min(limit, policy.max_apply)
+    if total and len(candidates) > policy.max_ratio * total:
+        summary["aborted"] = f"{len(candidates)} candidates exceed {policy.max_ratio:.0%} of {total} facts"
+        return summary
+
+    before = smoke_mod.run_smoke(store, smoke_cases or []) if smoke_cases else None
+    if before is not None:
+        summary["smoke_before"] = {"ok": before.get("ok"), "checked": before.get("checked")}
+
+    applied: list[dict] = []
+    for pair in candidates:
+        verdict = policy_mod.classify(pair, policy=policy)
+        if verdict == "never":
+            summary["never"] += 1
+            continue
+        if verdict == "propose" or not policy.auto:
+            summary["proposed"] += 1
+            if not dry_run:
+                _record_proposal(store, pair, "pending", batch_id)
+            continue
+        summary["auto"] += 1
+        if dry_run:
+            continue
+        if len(applied) >= budget:
+            summary["proposed"] += 1
+            _record_proposal(store, pair, "pending", batch_id)
+            continue
+        fn = apply_fn or (apply_merge if pair.get("kind") == "duplicate" else apply_conflict)
+        try:
+            result = fn(store, pair, dry_run=False, batch_id=batch_id)
+        except Exception as exc:  # noqa: BLE001 - one bad pair must not kill the batch
+            result = {"ok": False, "reason": f"{type(exc).__name__}: {exc}"}
+        if result.get("ok"):
+            applied.append(result)
+            _record_proposal(store, pair, "applied", batch_id)
+        else:
+            summary["aborted"] = f"apply failed: {result.get('reason')}"
+            break
+
+    summary["applied"] = len(applied)
+
+    after = smoke_mod.run_smoke(store, smoke_cases or []) if smoke_cases else None
+    if after is not None:
+        summary["smoke_after"] = {"ok": after.get("ok"), "checked": after.get("checked")}
+        if before is not None and applied:
+            cmp = smoke_mod.compare(before, after)
+            if not cmp.get("ok"):
+                restored = []
+                for item in applied:
+                    try:
+                        restored.append(maintenance.restore_fact(store, item["retire"]))
+                    except Exception as exc:  # noqa: BLE001
+                        restored.append({"error": str(exc)})
+                summary["reverted"] = True
+                summary["regressed"] = cmp.get("regressed", [])
+                summary["restored"] = restored
+    return summary
