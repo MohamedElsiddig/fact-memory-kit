@@ -300,23 +300,25 @@ def apply_merge(store, pair: dict, *, dry_run: bool = True) -> dict:
 
 # --------------------------------------------------------------- prefetch
 def prefetch(store, message: str, *, limit: int = 5, min_trust: float = 0.3,
-             min_score: float = 0.35) -> list[dict]:
+             min_score: float = 0.35, timeout: float = 1.5) -> list[dict] | None:
     """Semantic recall for a user message, read from the live store.
 
     Uses the embeddings in ``fact_embeddings`` and the configured embedding
-    endpoint. Returns [] when embeddings are unavailable, so the caller can
-    fall back silently.
+    endpoint. Returns ``None`` when the endpoint is unavailable (so a caller can
+    trip a circuit breaker) and ``[]`` when nothing scores above the threshold.
     """
     from .config import Config
     from .embed import from_config
 
     cfg = Config.load(str(getattr(store, "db_path", "") or "") or None)
+    client = from_config(cfg)
+    client.timeout, client.retries = timeout, 0
     try:
-        qvec = from_config(cfg).embed_one(message)
-    except Exception:  # noqa: BLE001 - endpoint down, degrade to no recall
-        return []
+        qvec = client.embed_one(message)
+    except Exception:  # noqa: BLE001 - endpoint down: caller decides
+        return None
     if not qvec:
-        return []
+        return None
 
     import math
     import struct
@@ -381,3 +383,64 @@ def index_pending(store, *, batch: int = 32, force: bool = False) -> dict:
     except Exception as exc:  # noqa: BLE001 - endpoint down: report, do not raise
         return {"model": model, "indexed": done, "pending": len(todo) - done, "error": str(exc)}
     return {"model": model, "indexed": done, "pending": len(todo) - done}
+
+
+# ------------------------------------------------------------ rank fusion
+def _rrf(rank: int, k: int = 60) -> float:
+    return 1.0 / (k + rank)
+
+
+def fuse_results(store, query: str, provider_facts: list[dict], *,
+                 semantic_weight: float = 0.5, limit: int = 10,
+                 min_trust: float = 0.3, timeout: float = 1.5) -> list[dict] | None:
+    """Re-rank provider hits with an embedding channel (RRF), keeping every provider fact.
+
+    Returns the merged list, or None when embeddings are unavailable so the caller
+    can return the provider's result untouched.
+    """
+    # Score the whole embedding channel: within-query margins are ~0.03 between
+    # neighbours, so a global similarity floor cannot separate signal from noise.
+    hits = prefetch(store, query, limit=1_000_000, min_trust=min_trust,
+                    min_score=0.0, timeout=timeout)
+    if hits is None:
+        return None
+    sem_rank = {h["fact_id"]: i for i, h in enumerate(hits, 1)}
+    sem_score = {h["fact_id"]: h["score"] for h in hits}
+
+    by_id: dict[int, dict] = {}
+    for i, fact in enumerate(provider_facts, 1):
+        fact = dict(fact)
+        score = _rrf(i) + (semantic_weight * _rrf(sem_rank[fact["fact_id"]])
+                           if fact["fact_id"] in sem_rank else 0.0)
+        fact["score"] = round(score, 6)
+        if fact["fact_id"] in sem_rank:
+            fact["semantic_score"] = sem_score[fact["fact_id"]]
+        by_id[fact["fact_id"]] = fact
+
+    # Reserve part of the result set for facts the provider missed entirely.
+    # Provider misses enter only when they are close to the top of the embedding
+    # channel. A fixed cosine floor misbehaves: nomic puts weak matches at ~0.51,
+    # barely below strong ones, so rank-relative gating is used instead.
+    reserve: list[dict] = []
+    cutoff = max(1, min(len(hits), 5))   # top-5 of the embedding channel
+    for hit in hits[:cutoff]:
+        if hit["fact_id"] in by_id:
+            continue
+        if len(reserve) >= max(1, limit // 2):
+            break
+        score = semantic_weight * _rrf(sem_rank[hit["fact_id"]])
+        row = store.read("SELECT fact_id, content, category, tags, trust_score FROM facts "
+                         "WHERE fact_id = ?", (hit["fact_id"],))
+        if not row:
+            continue
+        fact = dict(row[0])
+        fact["score"] = round(score, 6)
+        fact["semantic_score"] = hit["score"]
+        fact["source"] = "semantic"
+        reserve.append(fact)
+
+    ordered = sorted(by_id.values(), key=lambda f: -f["score"])
+    keep = max(0, limit - len(reserve))
+    return (ordered[:keep] + reserve)[:limit] if limit else ordered + reserve
+
+

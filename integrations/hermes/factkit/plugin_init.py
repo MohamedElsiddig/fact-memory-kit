@@ -39,6 +39,20 @@ def _config() -> dict:
         try:
             import yaml
             data = yaml.safe_load(path.read_text()) or {}
+        except ImportError:  # no PyYAML: parse the flat key: value subset we use
+            for line in path.read_text().splitlines():
+                line = line.split("#", 1)[0].strip()
+                if not line or ":" not in line:
+                    continue
+                key, _, value = line.partition(":")
+                value = value.strip().strip('"').strip("'")
+                if value.lower() in ("true", "false"):
+                    data[key.strip()] = value.lower() == "true"
+                else:
+                    try:
+                        data[key.strip()] = float(value) if "." in value else int(value)
+                    except ValueError:
+                        data[key.strip()] = value
         except Exception as exc:  # noqa: BLE001
             logger.warning("factkit: bad config.yaml (%s)", exc)
     for key, env in (("embed_base_url", "FACTKIT_EMBED_BASE_URL"),
@@ -77,6 +91,37 @@ def _min_score() -> float:
         return 0.55
 
 
+_BREAKER = {"fails": 0, "until": 0.0}
+
+
+def _breaker_trip() -> None:
+    import time
+    _BREAKER["fails"] += 1
+    if _BREAKER["fails"] >= 3:
+        _BREAKER["until"] = time.time() + _num("breaker_seconds", 300.0)
+
+
+def _breaker_open() -> bool:
+    import time
+    return time.time() < _BREAKER["until"]
+
+
+def _breaker_reset() -> None:
+    _BREAKER["fails"], _BREAKER["until"] = 0, 0.0
+
+
+def _num(key: str, default: float) -> float:
+    try:
+        return float(_config().get(key, default))
+    except (TypeError, ValueError):
+        return default
+
+
+def _merge_enabled() -> bool:
+    value = _config().get("merge_results", os.environ.get("FACTKIT_MERGE", "1"))
+    return str(value).lower() not in ("0", "false", "no")
+
+
 def _skip(message: str) -> bool:
     text = (message or "").strip()
     if len(text) < 12 or text.startswith("/"):
@@ -103,13 +148,26 @@ def on_pre_llm_call(**kwargs):
     message = kwargs.get("user_message") or ""
     if _skip(message):
         return []
+    if _breaker_open():
+        return []
     try:
         from .factkit import holo
         store = _store()
-        hits = holo.prefetch(store, message, limit=_limit(), min_score=_min_score())
+        hits = holo.prefetch(store, message, limit=_limit(), min_score=_min_score(),
+                             timeout=_num("embed_timeout_ms", 1500) / 1000.0)
     except Exception as exc:  # noqa: BLE001 - recall must never break a turn
         logger.debug("factkit prefetch skipped: %s", exc)
+        _breaker_trip()
         return []
+    if hits is None:
+        _breaker_trip()
+        return []
+    _breaker_reset()
+    if not hits:
+        return []
+
+    seen = _seen_contents()
+    hits = [h for h in hits if _norm(h["content"])[:60] not in seen]
     if not hits:
         return []
     lines = ["<semantic-memory>",
@@ -120,6 +178,69 @@ def on_pre_llm_call(**kwargs):
     lines.append("</semantic-memory>")
     logger.debug("factkit injected %d fact(s)", len(hits))
     return [{"context": "\n".join(lines)}]
+
+
+def _norm(text: str) -> str:
+    return " ".join(str(text or "").split()).lower()
+
+
+def _seen_contents() -> set[str]:
+    """Fact texts already shown this session (context block or tool results)."""
+    return {_norm(c)[:60] for c in _SEEN.get("contents", set())}
+
+
+def _mark_seen(contents) -> None:
+    bucket = _SEEN.setdefault("contents", set())
+    for content in contents:
+        bucket.add(_norm(content))
+    if len(bucket) > 500:
+        _SEEN["contents"] = set(list(bucket)[-300:])
+
+
+_SEEN: dict = {}
+
+
+def on_transform_tool_result(tool_name: str = "", args=None, result=None, **_kwargs):
+    """Re-rank and merge fact_store search results with the embedding channel.
+
+    Returns None when nothing changes, so the original result stands.
+    """
+    if not _merge_enabled() or tool_name != "fact_store" or not isinstance(result, str):
+        return None
+    if not isinstance(args, dict) or args.get("action") != "search":
+        return None
+    query = args.get("query") or ""
+    if not query.strip() or _breaker_open():
+        return None
+    try:
+        import json
+        payload = json.loads(result)
+    except Exception:  # noqa: BLE001
+        return None
+    facts = payload.get("facts")
+    if not isinstance(facts, list) or not facts:
+        return None
+    try:
+        from .factkit import holo
+        store = _store()
+        merged = holo.fuse_results(
+            store, query, facts,
+            semantic_weight=_num("semantic_weight", 0.5),
+            limit=max(len(facts), 5),
+            timeout=_num("embed_timeout_ms", 1500) / 1000.0)
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("factkit merge skipped: %s", exc)
+        _breaker_trip()
+        return None
+    if merged is None:
+        _breaker_trip()
+        return None
+    _breaker_reset()
+    _mark_seen(f["content"] for f in merged if f.get("content"))
+    payload["facts"] = merged
+    payload["count"] = len(merged)
+    payload["ranking"] = "fused"
+    return json.dumps(payload)
 
 
 def on_session_end(**_kwargs):
@@ -138,4 +259,5 @@ def on_session_end(**_kwargs):
 
 def register(ctx) -> None:
     ctx.register_hook("pre_llm_call", on_pre_llm_call)
+    ctx.register_hook("transform_tool_result", on_transform_tool_result)
     ctx.register_hook("on_session_end", on_session_end)

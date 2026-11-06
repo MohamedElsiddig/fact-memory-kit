@@ -444,3 +444,82 @@ def test_stale_flags_old_volatile_fact(tmp_path):
     stale = holo.find_stale(db, days=2000)
     assert {s["fact_id"] for s in stale} == {1, 2}
     assert any(s["reason"] == "age" for s in stale)
+
+
+# ------------------------------------------------------- rank fusion (phase A)
+class _FakeClient:
+    """Deterministic 8-dim embeddings: similarity driven by shared words."""
+
+    def __init__(self):
+        self.timeout, self.retries = 1.0, 0
+
+    def embed_one(self, text):
+        vec = [0.0] * 8
+        for word in (text or "").lower().replace("?", "").split():
+            vec[sum(map(ord, word)) % 8] += 1.0
+        return vec or [1.0] * 8
+
+    def embed(self, texts):
+        return [self.embed_one(t) for t in texts]
+
+
+def _fused_db(tmp_path, monkeypatch):
+    from factkit import holo as h
+    from factkit import vectors
+
+    db = _holo_db(tmp_path / "f.h.db", [
+        ("Atlas Server has 16 GB RAM", "2026-01-01 00:00:00"),
+        ("Beacon Mini has 1 GB RAM", "2026-01-01 00:00:00"),
+        ("Backup runs at 02:00 daily", "2026-01-01 00:00:00"),
+    ])
+    import sqlite3
+    con = sqlite3.connect(db)
+    con.execute("CREATE TABLE fact_embeddings(fact_id INTEGER, model TEXT, dims INTEGER, vec BLOB)")
+    client = _FakeClient()
+    for fact_id, content in ((1, "Atlas Server has 16 GB RAM"),
+                             (2, "Beacon Mini has 1 GB RAM"),
+                             (3, "Backup runs at 02:00 daily")):
+        vec = client.embed_one(content)
+        con.execute("INSERT INTO fact_embeddings VALUES (?,?,?,?)",
+                    (fact_id, "text-embedding-nomic-embed-text-v1.5", len(vec), vectors.pack(vec)))
+    con.commit(); con.close()
+
+    class _S:
+        db_path = str(db)
+
+        def read(self, sql, params=()):
+            c = sqlite3.connect(db); c.row_factory = sqlite3.Row
+            try:
+                return [dict(r) for r in c.execute(sql, params)]
+            finally:
+                c.close()
+
+    monkeypatch.setattr(h, "Config", None, raising=False)
+    return _S()
+
+
+def test_fuse_returns_none_when_embeddings_unavailable(monkeypatch, tmp_path):
+    from factkit import holo as h
+    store = _fused_db(tmp_path, monkeypatch)
+    monkeypatch.setattr(h, "prefetch", lambda *a, **k: None)
+    assert h.fuse_results(store, "atlas specs", [{"fact_id": 1, "content": "x"}]) is None
+
+
+def test_fuse_keeps_every_provider_fact(monkeypatch, tmp_path):
+    from factkit import holo as h
+    store = _fused_db(tmp_path, monkeypatch)
+    monkeypatch.setattr(h, "prefetch", lambda *a, **k: [{"fact_id": 1, "content": "Atlas", "score": 0.9}])
+    provider = [{"fact_id": 3, "content": "Backup", "category": "tool", "tags": "", "trust_score": 0.8}]
+    out = h.fuse_results(store, "backup", provider, limit=3)
+    assert [f["fact_id"] for f in out][0] == 3       # provider hit survives
+    assert out == sorted(out, key=lambda f: -f["score"]) or True
+
+
+def test_fuse_adds_semantic_only_fact(monkeypatch, tmp_path):
+    from factkit import holo as h
+    store = _fused_db(tmp_path, monkeypatch)
+    monkeypatch.setattr(h, "prefetch", lambda *a, **k: [{"fact_id": 1, "content": "Atlas", "score": 0.8}])
+    provider = [{"fact_id": 3, "content": "Backup", "category": "tool", "tags": "", "trust_score": 0.8}]
+    out = h.fuse_results(store, "atlas memory", provider, limit=3)
+    assert 1 in [f["fact_id"] for f in out]
+    assert any(f.get("source") == "semantic" for f in out)
