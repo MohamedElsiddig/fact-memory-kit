@@ -1,15 +1,18 @@
 """Read/write dashboard over stdlib HTTP: metrics, queues and one-click apply.
 
-Binds to loopback by default. There is no auth layer here on purpose — put it
-behind your own reverse proxy if you expose it.
+Binds to loopback by default. Set ``FACTKIT_DASHBOARD_TOKEN`` (or ``--token``) to
+require a bearer token; a browser can exchange ``/?token=...`` once for an
+HttpOnly cookie.
 """
 from __future__ import annotations
 
+import hmac
 import json
+from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
 
-from . import bridge, conflicts, metrics, ttl, tui
+from . import metrics, tui
 
 PAGE = """<!doctype html><html><head><meta charset="utf-8">
 <title>factkit</title>
@@ -55,7 +58,7 @@ load();
 </script></body></html>"""
 
 
-def make_handler(db_path):
+def make_handler(db_path, token: str = ""):
     """One Store per request: sqlite connections are thread-affine, and the
     dashboard is threaded. WAL makes concurrent readers cheap."""
     from .store import Store
@@ -66,20 +69,57 @@ def make_handler(db_path):
         def log_message(self, format, *args):  # noqa: A002 - stdlib signature
             pass
 
-        def _send(self, status: int, body: bytes, ctype: str = "application/json"):
+        # ------------------------------------------------------------------ io
+        def _send(self, status: int, body: bytes, ctype: str = "application/json",
+                  headers: list[tuple[str, str]] | None = None):
             self.send_response(status)
             self.send_header("Content-Type", ctype)
             self.send_header("Content-Length", str(len(body)))
             self.send_header("Cache-Control", "no-store")
+            for name, value in headers or []:
+                self.send_header(name, value)
             self.end_headers()
             self.wfile.write(body)
 
-        def _json(self, payload, status: int = 200):
-            self._send(status, json.dumps(payload, ensure_ascii=False, default=str).encode())
+        def _json(self, payload, status: int = 200, headers=None):
+            self._send(status,
+                       json.dumps(payload, ensure_ascii=False, default=str).encode(),
+                       headers=headers)
 
+        # ----------------------------------------------------------------- auth
+        def _supplied_token(self, query) -> str | None:
+            auth = self.headers.get("Authorization", "")
+            if auth.lower().startswith("bearer "):
+                return auth[7:].strip()
+            cookie = SimpleCookie(self.headers.get("Cookie", ""))
+            if "fk_token" in cookie:
+                return cookie["fk_token"].value
+            values = query.get("token")
+            return values[0] if values else None
+
+        def _authorised(self, query) -> bool:
+            if not token:
+                return True
+            supplied = self._supplied_token(query)
+            return bool(supplied) and hmac.compare_digest(supplied, token)
+
+        def _deny(self):
+            self._send(401, json.dumps({"error": "unauthorized"}).encode(),
+                       headers=[("WWW-Authenticate", 'Bearer realm="factkit"')])
+
+        # ------------------------------------------------------------------ GET
         def do_GET(self):  # noqa: N802
             url = urlparse(self.path)
             path, query = url.path, parse_qs(url.query)
+            if not self._authorised(query):
+                return self._deny()
+
+            if path in ("/", "/index.html") and token and query.get("token"):
+                # exchange the token for a cookie so the JS fetches authenticate
+                return self._send(303, b"", "text/plain",
+                                  headers=[("Location", "/"),
+                                           ("Set-Cookie",
+                                            f"fk_token={token}; HttpOnly; SameSite=Strict; Path=/")])
             if path in ("/", "/index.html"):
                 return self._send(200, PAGE.encode(), "text/html; charset=utf-8")
             try:
@@ -106,25 +146,22 @@ def make_handler(db_path):
                 return self._json({"error": str(exc)}, 500)
             return self._json({"error": "not found"}, 404)
 
+        # ----------------------------------------------------------------- POST
         def do_POST(self):  # noqa: N802
-            parts = [p for p in urlparse(self.path).path.split("/") if p]
+            url = urlparse(self.path)
+            if not self._authorised(parse_qs(url.query)):
+                return self._deny()
+            parts = [p for p in url.path.split("/") if p]
             if len(parts) == 4 and parts[0] == "api":
                 kind, item_id, action = parts[1], parts[2], parts[3]
                 if not item_id.isdigit() or action not in ("apply", "reject"):
                     return self._json({"error": "bad request"}, 400)
+                if kind not in ("conflict", "proposal", "ttl"):
+                    return self._json({"error": "unknown kind"}, 404)
                 try:
                     with Store(db_path) as store:
-                        if kind == "conflict":
-                            result = tui.decide(store, "conflict", int(item_id),
-                                                "accept" if action == "apply" else "reject")
-                        elif kind == "proposal":
-                            result = tui.decide(store, "proposal", int(item_id),
-                                                "accept" if action == "apply" else "reject")
-                        elif kind == "ttl":
-                            result = tui.decide(store, "ttl", int(item_id),
-                                                "accept" if action == "apply" else "reject")
-                        else:
-                            return self._json({"error": "unknown kind"}, 404)
+                        result = tui.decide(store, kind, int(item_id),
+                                            "accept" if action == "apply" else "reject")
                     return self._json(result)
                 except Exception as exc:  # noqa: BLE001
                     return self._json({"error": str(exc)}, 500)
@@ -133,9 +170,10 @@ def make_handler(db_path):
     return Handler
 
 
-def serve(store, host: str = "127.0.0.1", port: int = 8765) -> None:
-    httpd = ThreadingHTTPServer((host, port), make_handler(store.path))
-    print(f"factkit dashboard on http://{host}:{port}")
+def serve(store, host: str = "127.0.0.1", port: int = 8765, token: str = "") -> None:
+    httpd = ThreadingHTTPServer((host, port), make_handler(store.path, token))
+    print(f"factkit dashboard on http://{host}:{port}"
+          + (" (token required)" if token else ""))
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:

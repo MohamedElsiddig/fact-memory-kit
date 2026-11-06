@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -259,6 +260,9 @@ def cmd_review(args) -> int:
     if args.action:
         _print_json(tui.decide(store, args.kind, args.id, args.action))
         return 0
+    if args.curses or (sys.stdout.isatty() and not args.line):
+        from . import tui_curses
+        return tui_curses.interactive(store)
     return tui.interactive(store)
 
 
@@ -281,7 +285,8 @@ def cmd_bridge(args) -> int:
     result = bridge.run(store, cfg, Path(args.path).expanduser(),
                         include_assistant=args.include_assistant,
                         embedder=client, model=client.model,
-                        max_chunks=args.max_chunks, dry_run=args.dry_run)
+                        max_chunks=args.max_chunks, dry_run=args.dry_run,
+                        session_id=args.session, sessions=args.sessions)
     _print_json({k: v for k, v in result.items() if k != "facts"})
     for fact in result["facts"]:
         print(f"  + [{fact['category']}] {fact['content'][:100]}")
@@ -336,6 +341,13 @@ def cmd_export(args) -> int:
 
 def cmd_import(args) -> int:
     store = _store(args)
+    if args.hermes:
+        result = bulk.import_hermes(store, Path(args.hermes), dry_run=args.dry_run)
+        _print_json({k: v for k, v in result.items() if k != "detail"})
+        return 0
+    if not args.path:
+        print("error: give a path or --hermes <memory_store.db>", file=sys.stderr)
+        return 2
     result = bulk.import_facts(store, Path(args.path), dry_run=args.dry_run,
                                default_category=args.category)
     _print_json({k: v for k, v in result.items() if k != "detail"})
@@ -359,7 +371,8 @@ def cmd_report(args) -> int:
 
 def cmd_dashboard(args) -> int:
     from .server import serve
-    serve(_store(args), host=args.host, port=args.port)
+    token = args.token or os.environ.get("FACTKIT_DASHBOARD_TOKEN", "")
+    serve(_store(args), host=args.host, port=args.port, token=token)
     return 0
 
 
@@ -490,6 +503,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("review", help="interactive review of all queues")
     p.add_argument("--json", action="store_true")
+    p.add_argument("--curses", action="store_true", help="force the full-screen UI")
+    p.add_argument("--line", action="store_true", help="force the simple line UI")
     p.add_argument("--kind", choices=["conflict", "proposal", "ttl"])
     p.add_argument("--id", type=int)
     p.add_argument("--action", choices=["accept", "reject", "skip"])
@@ -509,6 +524,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--include-assistant", action="store_true")
     p.add_argument("--max-chunks", type=int, default=8)
     p.add_argument("--dry-run", action="store_true")
+    p.add_argument("--session", help="Hermes session id (when path is a .db)")
+    p.add_argument("--sessions", type=int, default=3,
+                   help="recent Hermes sessions to read (default 3)")
     p.set_defaults(func=cmd_bridge)
 
     p = sub.add_parser("props", help="review bridge proposals")
@@ -529,8 +547,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--with-embeddings", action="store_true")
     p.set_defaults(func=cmd_export)
 
-    p = sub.add_parser("import", help="import JSON/CSV with dry-run")
-    p.add_argument("path")
+    p = sub.add_parser("import", help="import JSON/CSV (or --hermes) with dry-run")
+    p.add_argument("path", nargs="?")
+    p.add_argument("--hermes", metavar="MEMORY_DB",
+                   help="import facts from a Hermes memory_store.db (read-only)")
     p.add_argument("--dry-run", action="store_true")
     p.add_argument("--category", default="general")
     p.add_argument("--validate-golden")
@@ -545,6 +565,8 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("dashboard", help="serve the review dashboard")
     p.add_argument("--host", default="127.0.0.1")
     p.add_argument("--port", type=int, default=8765)
+    p.add_argument("--token", default="",
+                   help="require this bearer token (or FACTKIT_DASHBOARD_TOKEN)")
     p.set_defaults(func=cmd_dashboard)
 
     p = sub.add_parser("entity", help="entities and aliases")

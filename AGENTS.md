@@ -102,7 +102,7 @@ when" with `factkit audit --fact-id <id> --json`.
 ```bash
 factkit conflicts scan     # stale contradictions
 factkit ttl scan           # aged facts and rotted ports/IPs/versions
-factkit bridge <session>   # optional: propose facts from a transcript
+factkit bridge <file|state.db>  # optional: propose facts from a transcript or Hermes DB
 factkit review             # human decides; never auto-apply
 factkit gate               # retrieval is still healthy
 factkit report             # numbers, not impressions
@@ -137,6 +137,7 @@ Prefer these fields over parsing human output.
 factkit export --out facts.json --with-embeddings
 factkit import facts.json --dry-run
 factkit import facts.json
+factkit import --hermes ~/.hermes/memory_store.db   # from a Hermes agent
 ```
 
 Import skips duplicates, validates trust scores, and never overwrites. Use
@@ -150,6 +151,7 @@ Import skips duplicates, validates trust scores, and never overwrites. Use
 | `coverage` below 100% | new facts added while the service was down | rerun `factkit embed` |
 | gate fails after adding facts | golden set is stale or retrieval regressed | `factkit gate -v`, then `golden-write` if the corpus changed |
 | `database is locked` | two writers | retry; WAL is on, keep writes short |
+| dashboard returns 401 | token configured, request has none | send `Authorization: Bearer <token>` or open `/?token=...` |
 | dashboard shows nothing | server started against another `FACTKIT_DB` | check `factkit doctor` |
 
 ## 10. What not to do

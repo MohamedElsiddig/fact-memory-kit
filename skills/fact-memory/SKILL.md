@@ -52,7 +52,7 @@ Never store questions, greetings, task state or transient secrets.
 ```bash
 factkit conflicts scan     # stale contradictions (proposals only)
 factkit ttl scan           # age + rotted ports/IPs/versions (proposals only)
-factkit bridge <file>      # opt-in: propose facts from a transcript
+factkit bridge <file|state.db>  # opt-in: transcript or Hermes DB
 factkit review             # accept / reject / skip
 factkit gate               # retrieval regression gate
 factkit report             # coverage, p50/p95 latency, hit rate, backlog
@@ -84,3 +84,7 @@ resolutions unless the user explicitly asks for that policy.
   `FACTKIT_EMBED_MODEL`, do not delete the previous rows unless asked.
 * **One writer at a time.** WAL allows concurrent readers, but keep batch writes
   short to avoid `database is locked`.
+* **factkit and Hermes stores are separate.** Import with `factkit import --hermes`
+  (read-only, preserves timestamps/entities); do not edit `memory_store.db` directly.
+* **Dashboard auth is opt-in.** Set `FACTKIT_DASHBOARD_TOKEN` before exposing it;
+  without a token every route is open to whoever can reach the port.

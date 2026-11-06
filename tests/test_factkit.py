@@ -288,3 +288,89 @@ def test_metrics_summary_counts_backlog(store):
     assert data["backlog"]["conflicts_pending"] == 1
     assert "factkit report" in metrics.render_text(data)
     assert "<html>" in metrics.render_html(data)
+
+
+# ------------------------------------------------------- hermes integration
+def _fake_hermes(path):
+    import sqlite3
+    con = sqlite3.connect(path)
+    con.executescript("""
+    CREATE TABLE facts(fact_id INTEGER PRIMARY KEY, content TEXT, category TEXT,
+                       tags TEXT, trust_score REAL, created_at TEXT, updated_at TEXT);
+    CREATE TABLE entities(entity_id INTEGER PRIMARY KEY, name TEXT);
+    CREATE TABLE fact_entities(fact_id INTEGER, entity_id INTEGER);
+    CREATE TABLE sessions(id TEXT PRIMARY KEY, title TEXT, started_at REAL, message_count INT);
+    CREATE TABLE messages(id INTEGER PRIMARY KEY, session_id TEXT, role TEXT,
+                          content TEXT, timestamp REAL);
+    """)
+    con.execute("INSERT INTO facts VALUES (1,'Atlas Server has 16 GB RAM','entity','a',0.9,"
+                "'2026-01-01 00:00:00','2026-05-01 00:00:00')")
+    con.execute("INSERT INTO facts VALUES (2,'Backup runs at 02:00','tool','b',0.8,"
+                "'2026-02-01 00:00:00','2026-06-01 00:00:00')")
+    con.execute("INSERT INTO entities VALUES (1,'Atlas Server')")
+    con.execute("INSERT INTO fact_entities VALUES (1,1)")
+    con.execute("INSERT INTO sessions VALUES ('s1','test',1.0,2)")
+    con.execute("INSERT INTO messages(session_id,role,content,timestamp) "
+                "VALUES ('s1','user','My Atlas Server has 16 GB RAM',1.0)")
+    con.execute("INSERT INTO messages(session_id,role,content,timestamp) "
+                "VALUES ('s1','assistant','noted',2.0)")
+    con.commit(); con.close()
+    return path
+
+
+def test_import_hermes_preserves_data(tmp_path, store):
+    src = _fake_hermes(tmp_path / "memory_store.db")
+    result = bulk.import_hermes(store, src)
+    assert result["added"] == 2 and result["rows"] == 2
+    fact = store.list_facts()[0]
+    assert fact["content"] == "Atlas Server has 16 GB RAM"
+    assert fact["updated_at"] == "2026-05-01 00:00:00"      # preserved
+    assert fact["source"] == "hermes-import"
+    assert any(e["name"] == "Atlas Server" for e in store.fact_entities(fact["fact_id"]))
+    # idempotent
+    assert bulk.import_hermes(store, src)["added"] == 0
+
+
+def test_import_hermes_dry_run(tmp_path, store):
+    src = _fake_hermes(tmp_path / "memory_store.db")
+    result = bulk.import_hermes(store, src, dry_run=True)
+    assert result["added"] == 2 and store.count() == 0
+
+
+def test_bridge_reads_hermes_db(tmp_path):
+    src = _fake_hermes(tmp_path / "memory_store.db")
+    messages, meta = bridge.read_hermes(src)
+    assert len(messages) == 1 and messages[0][0] == "user"
+    assert meta[0]["id"] == "s1"
+
+
+# ------------------------------------------------------------ dashboard auth
+def test_dashboard_requires_token(tmp_path, store):
+    import threading
+    import urllib.error
+    import urllib.request
+    from http.server import ThreadingHTTPServer
+    from factkit.server import make_handler
+
+    store.add_fact("Atlas Server has 16 GB RAM")
+    httpd = ThreadingHTTPServer(("127.0.0.1", 0), make_handler(store.path, "s3cret"))
+    port = httpd.server_address[1]
+    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    thread.start()
+    try:
+        with pytest.raises(urllib.error.HTTPError) as exc:
+            urllib.request.urlopen(f"http://127.0.0.1:{port}/api/summary", timeout=5)
+        assert exc.value.code == 401
+
+        req = urllib.request.Request(f"http://127.0.0.1:{port}/api/summary",
+                                     headers={"Authorization": "Bearer s3cret"})
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            assert resp.status == 200
+
+        req = urllib.request.Request(f"http://127.0.0.1:{port}/api/summary",
+                                     headers={"Authorization": "Bearer wrong"})
+        with pytest.raises(urllib.error.HTTPError) as exc:
+            urllib.request.urlopen(req, timeout=5)
+        assert exc.value.code == 401
+    finally:
+        httpd.shutdown(); httpd.server_close()

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import re
+import sqlite3
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
@@ -76,6 +77,50 @@ def read_messages(path: Path, include_assistant: bool = False) -> list[tuple[str
             if role.startswith(("user", "human")) or include_assistant:
                 out.append((role, block.strip()))
     return out
+
+
+def read_hermes(db_path: Path, session_id: str | None = None,
+                sessions: int = 3, max_messages: int = 400,
+                include_assistant: bool = False) -> tuple[list[tuple[str, str]], list[dict]]:
+    """Read user/assistant turns straight from a Hermes ``state.db`` (read-only).
+
+    Hermes keeps transcripts in ``messages(session_id, role, content, timestamp)``
+    with the session index in ``sessions``. The connection is opened ``mode=ro``:
+    this function can never mutate the live agent state.
+    """
+    db_path = Path(db_path).expanduser()
+    if not db_path.exists():
+        raise FileNotFoundError(db_path)
+    con = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=5.0)
+    con.row_factory = sqlite3.Row
+    try:
+        if session_id:
+            picked = [session_id]
+            meta = [dict(r) for r in con.execute(
+                "SELECT id, title, started_at, message_count FROM sessions WHERE id=?",
+                (session_id,))]
+        else:
+            rows = con.execute(
+                "SELECT id, title, started_at, message_count FROM sessions "
+                "WHERE message_count > 0 ORDER BY started_at DESC LIMIT ?",
+                (sessions,)).fetchall()
+            meta = [dict(r) for r in rows]
+            picked = [r["id"] for r in rows]
+        out: list[tuple[str, str]] = []
+        roles = ("user", "assistant") if include_assistant else ("user",)
+        for sid in picked:
+            rows = con.execute(
+                "SELECT role, content FROM messages WHERE session_id=? "
+                "AND role IN (%s) ORDER BY id LIMIT ?"
+                % ",".join("?" * len(roles)),
+                (sid, *roles, max_messages)).fetchall()
+            for row in rows:
+                content = (row["content"] or "").strip()
+                if content and not content.startswith("<"):
+                    out.append((row["role"], content))
+        return out, meta
+    finally:
+        con.close()
 
 
 def _pair(obj, include_assistant: bool) -> list[tuple[str, str]]:
@@ -157,8 +202,15 @@ def extract(messages: list[tuple[str, str]], cfg, *, max_chunks: int = 8) -> lis
 
 def run(store, cfg, path: Path, *, include_assistant: bool = False,
         embedder=None, model: str = "", max_chunks: int = 8,
-        dry_run: bool = False) -> dict:
-    messages = read_messages(path, include_assistant)
+        dry_run: bool = False, session_id: str | None = None,
+        sessions: int = 3) -> dict:
+    hermes_meta: list[dict] = []
+    if path.suffix in (".db", ".sqlite", ".sqlite3"):
+        messages, hermes_meta = read_hermes(path, session_id=session_id,
+                                            sessions=sessions,
+                                            include_assistant=include_assistant)
+    else:
+        messages = read_messages(path, include_assistant)
     candidates = extract(messages, cfg, max_chunks=max_chunks)
     kept, dupes = [], 0
     for cand in candidates:
@@ -175,6 +227,7 @@ def run(store, cfg, path: Path, *, include_assistant: bool = False,
                                reasons=f"confidence={cand.confidence:.2f}")
     store.db.commit()
     return {"messages": len(messages), "chunks": len(chunks(messages)),
+            "sessions": len(hermes_meta),
             "candidates": len(candidates), "duplicates": dupes,
             "proposed": len(kept), "dry_run": dry_run,
             "facts": [c.as_dict() for c in kept]}

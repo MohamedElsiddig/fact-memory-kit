@@ -22,10 +22,10 @@ facts ──┬── FTS5 (BM25) ─────┐
 | Golden gate | `factkit gate` | 28-case style regression suite with thresholds; fails the build on a drop |
 | Golden rule | `factkit conflicts scan` | same subject + same slot + different value → newer `updated_at` wins |
 | TTL flags | `factkit ttl scan` | age and slot-rot flags, never deletions |
-| Review queue | `factkit review` | one TUI for conflicts, proposals and TTL flags |
+| Review queue | `factkit review` | full-screen curses UI (line mode with `--line`) for conflicts, proposals and TTL flags |
 | Audit trail | `factkit audit` | append-only, before/after JSON on every mutation |
 | Proactive capture | `factkit capture "..."` | scores whether a message is worth storing, with reasons |
-| Session → facts | `factkit bridge session.jsonl` | opt-in LLM extraction, deduped, parked as proposals |
+| Session → facts | `factkit bridge session.jsonl` | opt-in LLM extraction, deduped, parked as proposals; reads Hermes `state.db` directly |
 | Query router | `factkit route "..."` | facts / wiki / live / external / mixed + the next command to run |
 | Bulk ops | `factkit export` / `import` | JSON or CSV, dry-run, duplicate skip, golden validation |
 | Metrics | `factkit report` / `dashboard` | p50/p95 latency, hit rate, coverage, backlog, HTML dashboard |
@@ -137,11 +137,12 @@ facts.
 ## Dashboard
 
 ```bash
-factkit dashboard --host 127.0.0.1 --port 8765
+factkit dashboard --host 127.0.0.1 --port 8765 --token "$(openssl rand -hex 16)"
 ```
 
-Read-only metrics plus one-click accept/reject for every queue. Loopback by
-default; there is no auth layer, so front it with your own proxy if exposed.
+Metrics plus one-click accept/reject for every queue. Loopback by default.
+With `--token` (or `FACTKIT_DASHBOARD_TOKEN`) every route requires a bearer token;
+open `http://host:8765/?token=...` once and the browser keeps an HttpOnly cookie.
 
 ## Use as a library
 
@@ -169,6 +170,15 @@ factkit import old_facts.json
 factkit entity relink
 factkit embed
 factkit golden-write        # build a labelled set from the imported corpus
+```
+
+Coming from a Hermes agent? Import its store directly — the source is opened
+read-only, timestamps and entity links are preserved:
+
+```bash
+factkit import --hermes ~/.hermes/memory_store.db --dry-run
+factkit import --hermes ~/.hermes/memory_store.db
+factkit embed
 ```
 
 The importer keeps original timestamps out of the write path, so the golden rule

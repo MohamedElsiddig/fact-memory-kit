@@ -9,6 +9,7 @@ from __future__ import annotations
 import csv
 import io
 import json
+import sqlite3
 from pathlib import Path
 
 FIELDS = ["fact_id", "content", "category", "tags", "trust_score", "source",
@@ -114,3 +115,79 @@ def validate_against_golden(path: Path, golden_path: Path) -> dict:
             if int(fid) not in ids:
                 missing.append({"query": case.get("q"), "fact_id": fid})
     return {"facts": len(ids), "missing": missing, "ok": not missing}
+
+def import_hermes(store, hermes_db: Path, *, dry_run: bool = False,
+                  keep_timestamps: bool = True) -> dict:
+    """Import facts (+ entity links) from a Hermes ``memory_store.db``.
+
+    The source is opened ``mode=ro``; it is never written to. Duplicates are
+    skipped by normalised content, and original trust/timestamps are preserved so
+    the golden rule still knows which facts are newer.
+    """
+    hermes_db = Path(hermes_db).expanduser()
+    if not hermes_db.exists():
+        raise FileNotFoundError(hermes_db)
+    con = sqlite3.connect(f"file:{hermes_db}?mode=ro", uri=True, timeout=5.0)
+    con.row_factory = sqlite3.Row
+    try:
+        columns = {r["name"] for r in con.execute("PRAGMA table_info(facts)")}
+        if "content" not in columns:
+            raise ValueError("source has no facts.content column")
+        select = ["fact_id", "content"]
+        for name in ("category", "tags", "trust_score", "created_at", "updated_at"):
+            if name in columns:
+                select.append(name)
+        rows = [dict(r) for r in con.execute(
+            f"SELECT {', '.join(select)} FROM facts ORDER BY fact_id")]
+        links: dict[int, list[int]] = {}
+        tables = {r[0] for r in con.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'")}
+        if {"fact_entities", "entities"} <= tables:
+            for r in con.execute(
+                    "SELECT fe.fact_id, e.name FROM fact_entities fe "
+                    "JOIN entities e ON e.entity_id=fe.entity_id"):
+                links.setdefault(int(r["fact_id"]), []).append(r["name"])
+    finally:
+        con.close()
+
+    existing = {" ".join(f["content"].lower().split()): f["fact_id"]
+                for f in store.list_facts(limit=1_000_000)}
+    added, skipped, errors = [], [], []
+    id_map: dict[int, int] = {}
+
+    for row in rows:
+        content = " ".join(str(row.get("content") or "").split())
+        if not content:
+            errors.append({"fact_id": row.get("fact_id"), "error": "empty content"})
+            continue
+        key = content.lower()
+        if key in existing:
+            skipped.append({"fact_id": row.get("fact_id"),
+                            "fact_id_here": existing[key], "reason": "duplicate"})
+            continue
+        if dry_run:
+            added.append({"fact_id": row.get("fact_id"), "content": content[:80]})
+            continue
+        fact = store.add_fact(
+            content,
+            category=(row.get("category") or "general"),
+            tags=(row.get("tags") or ""),
+            trust_score=float(row.get("trust_score") or 0.5),
+            source="hermes-import",
+            actor="import", reason="migrated from Hermes memory_store.db",
+        )
+        id_map[int(row["fact_id"])] = fact["fact_id"]
+        existing[key] = fact["fact_id"]
+        if keep_timestamps and row.get("created_at"):
+            store.db.execute(
+                "UPDATE facts SET created_at=?, updated_at=? WHERE fact_id=?",
+                (row.get("created_at"), row.get("updated_at") or row.get("created_at"),
+                 fact["fact_id"]))
+        for name in links.get(int(row["fact_id"]), []):
+            entity_id = store.ensure_entity(name)
+            store.link_entity(fact["fact_id"], entity_id)
+        added.append({"fact_id": row.get("fact_id"), "fact_id_here": fact["fact_id"]})
+    store.db.commit()
+    return {"source": str(hermes_db), "rows": len(rows), "added": len(added),
+            "skipped": len(skipped), "errors": errors, "dry_run": dry_run,
+            "detail": added[:50]}
