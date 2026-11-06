@@ -691,7 +691,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("action", choices=["conflicts", "stale", "dupes", "maintain",
                                       "undo", "tombstones", "purge", "guard",
                                       "decay", "provenance", "prose", "metrics",
-                                      "limits", "approve", "asof"])
+                                      "limits", "approve", "asof", "expand", "migrate",
+                                      "relations", "hops", "hrr", "rerank", "ns"])
     p.add_argument("--db", default=str(Path.home() / ".hermes" / "memory_store.db"))
     p.add_argument("--apply", action="store_true", help="write changes (default: report only)")
     p.add_argument("--days", type=int, default=90)
@@ -709,6 +710,19 @@ def build_parser() -> argparse.ArgumentParser:
                    help="smoke cases file; a regression reverts the batch")
     p.add_argument("--fact-id", type=int, default=None, help="fact id for undo")
     p.add_argument("--code", default=None, help="proposal code for 'approve'")
+    p.add_argument("--model", default=None, help="target embedding model for 'migrate'")
+    p.add_argument("--verify", action="store_true", help="verify instead of plan")
+    p.add_argument("--rollback", action="store_true", help="remove the target model's vectors")
+    p.add_argument("--src", type=int, default=None, help="relation source fact id")
+    p.add_argument("--dst", type=int, default=None, help="relation destination fact id")
+    p.add_argument("--rel", default=None, help="relation label")
+    p.add_argument("--path-to", dest="path_to", type=int, default=None,
+                   help="find a relation path from --src to this id")
+    p.add_argument("--depth", type=int, default=2, help="hop depth")
+    p.add_argument("--timeout", type=float, default=None, help="per-call timeout in seconds")
+    p.add_argument("--namespace", default=None, help="namespace for 'ns'")
+    p.add_argument("--assign-id", dest="assign_id", type=int, default=None,
+                   help="fact id to tag into --namespace")
     p.add_argument("--reject", action="store_true", help="reject instead of accept")
     p.add_argument("--as-of", dest="as_of", default=None, metavar="ISO",
                    help="point in time for 'asof' queries")
@@ -874,6 +888,99 @@ def cmd_holo(args) -> int:
         verdict = live_metrics.gate(result)
         _print_json({"db": args.db, "cases": path, **result, "gate": verdict})
         return 0 if verdict["ok"] else 1
+    if action == "expand":
+        from . import expand as ex
+        if not args.text:
+            _print_json({"error": "--text is required for expand"})
+            return 2
+        plan = ex.expand(args.text)
+        hits = holo.prefetch(store, ex.for_prefetch(args.text), limit=args.limit or 5,
+                             timeout=args.timeout) or []
+        _print_json({"db": args.db, **plan, "for_prefetch": ex.for_prefetch(args.text),
+                     "hits": ex.apply(args.text, hits)})
+        return 0
+    if action == "migrate":
+        from . import migrate
+        from .config import Config
+        from .embed import from_config
+        model = args.model or Config.load(args.db).embed_model
+        if args.rollback:
+            _print_json({"db": args.db, "rollback": migrate.rollback(
+                store, model, confirm_token=migrate.CONFIRM_TOKEN)})
+            return 0
+        if args.verify:
+            _print_json({"db": args.db, "verify": migrate.verify(store, model)})
+            return 0
+        plan = migrate.plan(store, model)
+        result = None
+        if args.apply:
+            result = migrate.run(store, from_config(Config.load(args.db)), model,
+                                 dry_run=False, limit=args.limit or None)
+        _print_json({"db": args.db, "plan": plan, "result": result})
+        return 0
+    if action == "relations":
+        from . import relations
+        relations.ensure_schema(store)
+        if args.src and args.dst and args.rel and args.apply:
+            _print_json({"db": args.db, "linked": relations.link(
+                store, args.src, args.dst, rel=args.rel)})
+            return 0
+        if args.path_to and args.src:
+            _print_json({"db": args.db, "path": relations.path(
+                store, args.src, args.path_to, max_depth=args.depth, rel=args.rel)})
+            return 0
+        _print_json({"db": args.db, "stats": relations.stats(store),
+                     "inferred": relations.infer(store, limit=args.limit or 10)})
+        return 0
+    if action == "hops":
+        from . import multihop
+        if not args.text:
+            _print_json({"error": "--text is required for hops"})
+            return 2
+        _print_json({"db": args.db, **multihop.expand_query(
+            store, args.text, limit=args.limit or 5, depth=args.depth)})
+        return 0
+    if action == "hrr":
+        from . import hrr, live_metrics
+        path = args.smoke or "examples/smoke_cases.json"
+        cases = live_metrics.load_cases(path, store)
+        _print_json({"db": args.db, "cases": path,
+                     **hrr.compare_with_provider(store, cases, k=args.limit or 5)})
+        return 0
+    if action == "rerank":
+        from . import adjudicate, rerank
+        from .config import Config
+        if not args.text:
+            _print_json({"error": "--text is required for rerank"})
+            return 2
+        cfg = Config.load(args.db)
+        if args.llm_url:
+            cfg.llm_base_url = args.llm_url.rstrip("/")
+        if args.llm_model:
+            cfg.llm_model = args.llm_model
+
+        class _Client:
+            def chat(self, prompt):
+                return adjudicate._post(cfg, prompt)
+
+        hits = holo.prefetch(store, args.text, limit=args.limit or 5) or []
+        _print_json({"db": args.db, **rerank.rerank(_Client(), args.text, hits,
+                                                   timeout_ms=args.timeout * 1000 if args.timeout else 250)})
+        return 0
+    if action == "ns":
+        from . import namespaces
+        if args.assign_id and args.namespace:
+            _print_json({"db": args.db, "assigned": namespaces.assign(
+                store, args.assign_id, args.namespace, create=args.apply)})
+            return 0
+        if args.text and args.namespace:
+            _print_json({"db": args.db, **namespaces.scope_query(
+                store, args.text, args.namespace, limit=args.limit or 5)})
+            return 0
+        _print_json({"db": args.db, "detect": namespaces.detect(store),
+                     "namespaces": namespaces.list_namespaces(store),
+                     "stats": namespaces.stats(store)})
+        return 0
     if action == "limits":
         from . import limits
         report = limits.inspect(store)

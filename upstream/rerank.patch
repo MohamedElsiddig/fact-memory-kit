@@ -1,0 +1,101 @@
+--- a/retrieval.py
++++ b/retrieval.py
+@@ -6,8 +6,9 @@
+ import logging
+ import math
+ import re
++import time
+ from datetime import datetime, timezone
+-from typing import TYPE_CHECKING
++from typing import TYPE_CHECKING, Callable
+ 
+ if TYPE_CHECKING:
+     from .store import MemoryStore
+@@ -50,8 +51,14 @@
+     """Multi-strategy fact retrieval with trust-weighted scoring."""
+ 
+     def __init__(self, store: MemoryStore, temporal_decay_half_life: int = 0,  # days, 0 = disabled
+-                 fts_weight: float = 0.4, jaccard_weight: float = 0.3, hrr_weight: float = 0.3, hrr_dim: int = 1024):
++                 fts_weight: float = 0.4, jaccard_weight: float = 0.3, hrr_weight: float = 0.3, hrr_dim: int = 1024,
++                 rerank: Callable[[str, list[dict], int], "list[dict] | None"] | None = None,
++                 candidate_window: int | None = None, rerank_timeout_ms: int = 250):
+         self.store, self.half_life, self.hrr_dim = store, temporal_decay_half_life, hrr_dim
++        self.rerank_hook, self.rerank_timeout_ms = rerank, rerank_timeout_ms
++        # None keeps the historical window (limit * 3). A hook wants a wider one than the final slice, so the two
++        # are decoupled here rather than at every call site.
++        self.candidate_window = max(1, candidate_window) if candidate_window else None
+         if hrr_weight > 0 and not hrr._HAS_NUMPY:  # redistribute weights without numpy
+             fts_weight, jaccard_weight, hrr_weight = 0.6, 0.4, 0.0
+         self.fts_weight, self.jaccard_weight, self.hrr_weight = fts_weight, jaccard_weight, hrr_weight
+@@ -69,15 +76,17 @@
+             return None
+ 
+     def search(self, query: str, category: str | None = None, min_trust: float = 0.3, limit: int = 10) -> list[dict]:
+-        """FTS5 candidates (limit*3) → Jaccard + HRR rerank → trust weighting → optional temporal decay
+-        0.5^(age_days / half_life). Returns fact dicts with 'score', sorted desc."""
++        """FTS5 candidates (``candidate_window``, default limit*3) → Jaccard + HRR rerank → trust weighting →
++        optional ``rerank`` hook → optional temporal decay 0.5^(age_days / half_life). Returns fact dicts with
++        'score', sorted desc."""
+         terms = query_terms(query or "")
+-        candidates = {f["fact_id"]: f for f in self._fts_candidates(query, category, min_trust, limit * 3)
++        window = max(limit, self.candidate_window or limit * 3)
++        candidates = {f["fact_id"]: f for f in self._fts_candidates(query, category, min_trust, window)
+                       if self._contains_a_term(terms, f)}
+-        for fact in self._ngram_candidates(query, category, min_trust, limit * 3):
++        for fact in self._ngram_candidates(query, category, min_trust, window):
+             if fact["fact_id"] not in candidates or candidates[fact["fact_id"]].get("fts_rank", 0) < fact["fts_rank"]:
+                 candidates[fact["fact_id"]] = fact
+-        for fact in self._scan_candidates(terms, category, min_trust, limit * 3):
++        for fact in self._scan_candidates(terms, category, min_trust, window):
+             candidates.setdefault(fact["fact_id"], fact)  # fills in what FTS cannot see; FTS ranks what it found
+         return self._rerank(query, list(candidates.values()), limit)
+ 
+@@ -193,11 +202,47 @@
+             fact["score"] = relevance * fact["trust_score"]
+             if self.half_life > 0:
+                 fact["score"] *= self._temporal_decay(fact.get("updated_at") or fact.get("created_at"))
+-        results = sorted(candidates, key=lambda x: x["score"], reverse=True)[:limit]
++        ranked = sorted(candidates, key=lambda x: x["score"], reverse=True)
++        if self.rerank_hook is not None:
++            ranked = self._apply_rerank(query, ranked, limit)
++        results = ranked[:limit]
+         for fact in results:
+             fact.pop("hrr_vector", None)  # callers expect JSON-serializable dicts
+         return results
+ 
++    def _apply_rerank(self, query: str, ranked: list[dict], limit: int) -> list[dict]:
++        """Run the optional rerank hook over every scored candidate, before the final slice.
++
++        The hook returns the candidates it wants, best first, or None to keep the provider order. It can only
++        reorder: it receives copies of the scored rows, an id outside *ranked* is dropped, duplicates and
++        non-dicts are ignored, and the provider order fills the list back up to *limit*. An exception, or a call
++        over ``rerank_timeout_ms``, is logged and never fails the search: a broken hook costs a reranked ranking,
++        not a turn.
++        """
++        started = time.monotonic()
++        try:
++            picked = self.rerank_hook(query, [dict(f) for f in ranked], limit)
++        except Exception as exc:  # noqa: BLE001 - a hook must never fail a search
++            logger.warning("holographic: rerank hook failed, keeping provider order (%s)", exc)
++            return ranked
++        elapsed_ms = (time.monotonic() - started) * 1000.0
++        if elapsed_ms > self.rerank_timeout_ms:
++            logger.warning("holographic: rerank hook took %.0fms (budget %dms)", elapsed_ms, self.rerank_timeout_ms)
++        if not isinstance(picked, list):
++            if picked is not None:
++                logger.warning("holographic: rerank hook returned %s, keeping provider order", type(picked).__name__)
++            return ranked
++        by_id = {f["fact_id"]: f for f in ranked}
++        out: list[dict] = []
++        seen: set[int] = set()
++        for item in picked:
++            fact_id = item.get("fact_id") if isinstance(item, dict) else None
++            if isinstance(fact_id, int) and fact_id in by_id and fact_id not in seen:
++                seen.add(fact_id)
++                # the provider's row, not the hook's copy: score and trust cannot be forged
++                out.append(by_id[fact_id])
++        return out + [f for f in ranked if f["fact_id"] not in seen]
++
+     def _linked_facts(self, entity_groups: list[list[int]], category: str | None, min_trust: float, limit: int) -> list[dict]:
+         """Facts linked to at least one entity of EVERY group (each group = the ids one name resolves to)."""
+         joins = " INTERSECT ".join(

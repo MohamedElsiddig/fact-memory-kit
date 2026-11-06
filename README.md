@@ -36,6 +36,13 @@ conflict detection, TTL review, duplicate merge, and an audit trail.
 | Store limits | `factkit holo limits [--apply]` | archive, audit/tombstone pruning, WAL-safe vacuum |
 | Time-aware query | `factkit holo asof --text "..." --as-of DATE` | what was true at a point in time |
 | Backup + drill | `factkit_backup.py [--drill]` | sqlite backup API, integrity check, restore rehearsal |
+| Query expansion | `factkit holo expand --text "..."` | alias-expanded query, then a capped re-rank of prefetch hits |
+| Model migration | `factkit holo migrate [--apply] [--verify] [--rollback]` | resumable vectors for a second embedding model, old rows untouched |
+| Relations | `factkit holo relations [--src N --dst M --rel R --apply]` | edge graph, inferred edges (proposals only), stats |
+| Multi-hop | `factkit holo hops --text "..." --depth 2` | walks relation edges from prefetch seeds, score decays per hop |
+| HRR benchmark | `factkit holo hrr` / `scripts/hrr_bench.py` | HRR vs lexical A/B; exits 1 unless it wins both metrics |
+| Cross-encoder rerank | `factkit holo rerank --text "..." --llm-url ...` | opt-in, 250 ms budget, refuses the new order without a gain |
+| Namespaces | `factkit holo ns [--namespace X --assign-id N]` | tag-based scoping (`ns:<name>`), post-filtered recall |
 | Semantic query | `factkit prefetch "..."` | exactly what the hook would inject |
 | Golden gate | `factkit gate` | retrieval regression suite with thresholds |
 | Standalone mode | `factkit init` / `embed` / `search` | own store, for use without Hermes |
@@ -281,6 +288,33 @@ Query embeddings are cached in `~/.hermes/embed_cache.db` (sqlite, float32,
 768 dims ~3 KB/vector, 30-day TTL, 5000 entries). Warm queries drop from
 ~0.13s to ~0.02s; a cache fault falls back to the endpoint and never fails a
 turn. Override the path with `FACTKIT_EMBED_CACHE`.
+
+## Experiments and opt-in paths
+
+None of these run inside the per-turn hook; each is an explicit command, and the
+ones with a measured downside say so.
+
+- **Query expansion** (`expand.py`) maps a curated alias set (laptop/notebook,
+  memory/ram, stt/transcription...) onto the query, caps the bonus at 0.15 and
+  leaves the original string alone when expansion would double its length.
+- **Model migration** (`migrate.py`) adds vectors for a second model beside the
+  existing rows (`INSERT OR IGNORE`, one transaction per batch, resumable).
+  `verify` requires full coverage and no duplicate/dim-mismatched rows; `rollback`
+  needs the literal token and refuses to remove the last model.
+- **Relations and multi-hop** (`relations.py`, `multihop.py`) add an edge table and
+  a BFS walk (decay 0.6 per hop, fanout 5, budget 40, cycle-safe). `infer` writes
+  nothing. Multi-hop is for connection questions only - it costs extra reads.
+- **HRR** (`hrr.py`) is a candidate re-ranker with a benchmark harness. On the
+  current corpus it beats lexical on MRR but not hit@5, so the bench exits 1 and
+  nothing is wired into the hook. Wire it only when the A/B wins both.
+- **Cross-encoder rerank** (`rerank.py`) is opt-in and budgeted: with a local
+  7B-class model it measured ~2.3 s for 5 hits, so it correctly returns
+  `reason: "no_gain"`/timeout and keeps the original order. Do not enable it in
+  the 250 ms hook path.
+- **Namespaces** (`namespaces.py`) detects the store shape. The live provider has
+  `memory_banks`, but only as a category-level vector cache with no fact->bank
+  membership, so namespaces are the `ns:<name>` tag convention. Scoping is a
+  post-filter: a small namespace returns fewer than `limit`.
 
 ## Hybrid results
 

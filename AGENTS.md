@@ -162,6 +162,14 @@ factkit holo prose      --db $DB --apply --llm-url https://llm.local/v1 --llm-mo
 factkit holo metrics    --db $DB --smoke <cases.json>  # hit@k + MRR, exit 1 when the gate fails
 factkit holo limits     --db $DB [--apply]             # prune tombstones/audit, vacuum
 factkit holo asof       --db $DB --text "<query>" --as-of 2026-03-01
+
+factkit holo expand     --db $DB --text "<query>"          # alias expansion + capped rerank
+factkit holo migrate    --db $DB [--verify] [--apply]      # second model, additive
+factkit holo relations  --db $DB [--src N --dst M --rel R --apply]
+factkit holo hops       --db $DB --text "<query>" --depth 2
+factkit holo hrr        --db $DB --smoke <cases.json>      # A/B; exit 1 unless it wins both
+factkit holo rerank     --db $DB --text "<query>" --llm-url https://llm.local/v1 --llm-model <id>
+factkit holo ns         --db $DB [--namespace X --assign-id N] [--text "<query>"]
 ```
 
 Standalone mode (the factkit corpus):
@@ -194,6 +202,15 @@ Rules:
   so when reporting historical answers.
 * Backups: `~/.hermes/scripts/factkit_backup.py` daily at 02:40, restore drill
   Sundays at 05:00 (`factkit_drill.sh`). Both silent on success.
+* None of `expand`, `hops`, `hrr`, `rerank` or `ns` belong in the per-turn hook.
+  `hops` costs extra reads; `rerank` measured ~2.3 s for five hits and must keep
+  returning `no_gain` rather than reordering; `hrr` does not beat lexical on
+  hit@5 yet, so do not wire it.
+* `holo migrate --apply` is additive (`INSERT OR IGNORE`), resumable, and never
+  touches another model's rows. `--rollback` needs the literal confirm token and
+  refuses to delete the last model.
+* `relations.infer` and `ns` listing are proposals/read-only; `link` is the only
+  write and it is explicit.
 * Smoke-case ids in `examples/smoke_cases.json` are placeholders; replace them
   with ids from the store being guarded or the gate checks nothing.
 * `bridge` requires an LLM endpoint and is opt-in; proposals are deduped.
