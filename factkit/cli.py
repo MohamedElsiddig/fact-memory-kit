@@ -671,7 +671,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser("holo", help="maintain the live holographic memory store")
     p.add_argument("action", choices=["conflicts", "stale", "dupes", "maintain",
-                                      "undo", "tombstones", "purge"])
+                                      "undo", "tombstones", "purge", "guard"])
     p.add_argument("--db", default=str(Path.home() / ".hermes" / "memory_store.db"))
     p.add_argument("--apply", action="store_true", help="write changes (default: report only)")
     p.add_argument("--days", type=int, default=90)
@@ -686,6 +686,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--smoke", metavar="JSON", default=None,
                    help="smoke cases file; a regression reverts the batch")
     p.add_argument("--fact-id", type=int, default=None, help="fact id for undo")
+    p.add_argument("--text", default=None, metavar="FACT",
+                   help="candidate fact text for 'guard' (checks before writing)")
     p.add_argument("--max-ratio", type=float, default=0.20,
                    help="abort when candidates exceed this fraction of the store")
     p.set_defaults(func=cmd_holo)
@@ -804,6 +806,16 @@ def cmd_holo(args) -> int:
         removed = maintenance.purge_tombstones(store, days=args.days)
         _print_json({"db": args.db, "purged": removed, "days": args.days})
         return 0
+    if action == "guard":
+        from . import guard
+        if not args.text:
+            _print_json({"error": "--text is required for guard", "verdict": "error"})
+            return 2
+        result = guard.check(store, args.text)
+        _print_json({"db": args.db, "text": args.text, **result,
+                     "human": guard.format_report(result)})
+        # exit 1 so a shell or hook can treat a blocked insert as failure
+        return 0 if result.get("verdict") == "ok" else 1
     raise SystemExit(f"unknown action {action}")
 
 
