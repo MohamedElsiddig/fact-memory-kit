@@ -44,9 +44,12 @@ def test_provider_results_key_is_merged(tmp_path, monkeypatch):
     mod = _load(tmp_path)
     _stub(mod, monkeypatch, [{"fact_id": 1, "content": "one", "score": 0.5},
                               {"fact_id": 2, "content": "two", "score": 0.4}])
-    out = mod.on_transform_tool_result(tool_name="fact_store",
-                                       args={"action": "search", "query": "q"},
-                                       result=_payload("results"))
+    out = mod.on_transform_tool_result(
+        tool_name="fact_store",
+        args={"action": "search", "query": "q"},
+        result=json.dumps({"results": [{"fact_id": 1, "content": "one"},
+                                       {"fact_id": 2, "content": "two"}], "count": 2}),
+    )
     data = json.loads(out)
     assert data["results"] == [{"fact_id": 1, "content": "one", "score": 0.5},
                                {"fact_id": 2, "content": "two", "score": 0.4}]
@@ -123,7 +126,8 @@ def test_provider_limit_3_returns_exactly_3(tmp_path, monkeypatch):
     assert calls[-1]["limit"] == 3
 
 
-def test_provider_3_limit_5_allows_semantic_add(tmp_path, monkeypatch):
+def test_provider_3_limit_5_is_bounded_by_provider_page(tmp_path, monkeypatch):
+    """The provider page bounds the response: no semantic rows beyond it."""
     mod = _load(tmp_path)
     provider = _facts([1, 2, 3])
     semantic = [{"fact_id": 10, "content": "semantic ten", "score": 0.2,
@@ -132,10 +136,10 @@ def test_provider_3_limit_5_allows_semantic_add(tmp_path, monkeypatch):
                  "source": "semantic"}]
     data, calls = _run(mod, monkeypatch, provider, provider + semantic, limit=5)
     ids = [f["fact_id"] for f in data["results"]]
-    assert len(ids) == 5
-    assert {1, 2, 3}.issubset(ids)
-    assert len(ids) - len(provider) <= 2
-    assert calls[-1]["limit"] == 5
+    assert ids == [1, 2, 3]
+    assert data["count"] == 3
+    assert calls[-1]["limit"] == 3
+    assert 10 not in ids and 11 not in ids
 
 
 def test_provider_6_limit_4_first_four_provider_order(tmp_path, monkeypatch):
@@ -154,6 +158,57 @@ def test_no_limit_falls_back_to_config_limit(tmp_path, monkeypatch):
     assert [f["fact_id"] for f in data["results"]] == [1, 2, 3]
     assert data["count"] == 3
     assert calls[-1]["limit"] == 3
+
+
+def test_provider_3_limit_6_bounded_to_provider_page(tmp_path, monkeypatch):
+    """A larger caller limit cannot pull semantic rows past the provider page."""
+    mod = _load(tmp_path)
+    provider = _facts([1, 2, 3])
+    semantic = [{"fact_id": 10, "content": "semantic ten", "score": 0.2,
+                 "source": "semantic"}]
+    data, calls = _run(mod, monkeypatch, provider, provider + semantic, limit=6)
+    ids = [f["fact_id"] for f in data["results"]]
+    assert ids == [1, 2, 3]
+    assert data["count"] == 3
+    assert calls[-1]["limit"] == 3
+    assert 10 not in ids
+
+
+def test_provider_3_limit_3_returns_exactly_3(tmp_path, monkeypatch):
+    mod = _load(tmp_path)
+    provider = _facts([1, 2, 3])
+    semantic = [{"fact_id": 10, "content": "semantic ten", "score": 0.2,
+                 "source": "semantic"}]
+    data, calls = _run(mod, monkeypatch, provider, provider + semantic, limit=3)
+    ids = [f["fact_id"] for f in data["results"]]
+    assert ids == [1, 2, 3]
+    assert data["count"] == 3
+    assert calls[-1]["limit"] == 3
+
+
+def test_provider_6_limit_6_unchanged(tmp_path, monkeypatch):
+    mod = _load(tmp_path)
+    provider = _facts([1, 2, 3, 4, 5, 6])
+    data, calls = _run(mod, monkeypatch, provider, provider, limit=6)
+    ids = [f["fact_id"] for f in data["results"]]
+    assert ids == [1, 2, 3, 4, 5, 6]
+    assert data["count"] == 6
+    assert calls[-1]["limit"] == 6
+
+
+def test_provider_1_limit_6_bounded_to_one(tmp_path, monkeypatch):
+    """A one-row provider page stays one row; no semantic expansion."""
+    mod = _load(tmp_path)
+    provider = _facts([1])
+    semantic = [{"fact_id": 10, "content": "semantic ten", "score": 0.2,
+                 "source": "semantic"},
+                {"fact_id": 11, "content": "semantic eleven", "score": 0.1,
+                 "source": "semantic"}]
+    data, calls = _run(mod, monkeypatch, provider, provider + semantic, limit=6)
+    ids = [f["fact_id"] for f in data["results"]]
+    assert ids == [1]
+    assert data["count"] == 1
+    assert calls[-1]["limit"] == 1
 
 
 def test_fused_page_longer_than_limit_is_trimmed_after_rerank(tmp_path, monkeypatch):
@@ -185,9 +240,10 @@ def test_trim_happens_after_rerank(tmp_path, monkeypatch):
 
 def test_limit_is_clamped_to_50(tmp_path, monkeypatch):
     mod = _load(tmp_path)
-    provider = _facts([1, 2, 3])
-    _, calls = _run(mod, monkeypatch, provider, provider, limit=500)
+    provider = _facts(range(1, 61))
+    data, calls = _run(mod, monkeypatch, provider, provider, limit=500)
     assert calls[-1]["limit"] == 50
+    assert data["count"] == 50
 
 
 def test_limit_accepts_numeric_string(tmp_path, monkeypatch):
@@ -225,7 +281,7 @@ def test_empty_results_list_returns_original(tmp_path, monkeypatch):
 
 def test_missing_limit_uses_configured_value(tmp_path, monkeypatch):
     mod = _load(tmp_path)
-    provider = _facts([1, 2, 3])
+    provider = _facts(range(1, 11))
     calls = []
     _stub(mod, monkeypatch, provider)
     monkeypatch.setattr(mod, "_rerank_enabled", lambda: False)
@@ -238,7 +294,7 @@ def test_missing_limit_uses_configured_value(tmp_path, monkeypatch):
         result=json.dumps({"results": provider, "count": len(provider)}),
     )
     assert calls[-1]["limit"] == 7
-    assert json.loads(out)["count"] == 3
+    assert json.loads(out)["count"] == 7
 
 
 def test_remember_only_sees_emitted_rows(tmp_path, monkeypatch):
