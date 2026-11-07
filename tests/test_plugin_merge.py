@@ -154,3 +154,60 @@ def test_no_limit_falls_back_to_config_limit(tmp_path, monkeypatch):
     assert [f["fact_id"] for f in data["results"]] == [1, 2, 3]
     assert data["count"] == 3
     assert calls[-1]["limit"] == 3
+
+
+def test_fused_page_longer_than_limit_is_trimmed_after_rerank(tmp_path, monkeypatch):
+    """A fused/reranked page may be longer than the caller's page size."""
+    mod = _load(tmp_path)
+    provider = _facts([1, 2, 3, 4, 5, 6])
+    data, calls = _run(mod, monkeypatch, provider, provider, limit=4)
+    assert [f["fact_id"] for f in data["results"]] == [1, 2, 3, 4]
+    assert data["count"] == 4
+    assert calls[-1]["limit"] == 4
+
+
+def test_trim_happens_after_rerank(tmp_path, monkeypatch):
+    mod = _load(tmp_path)
+    provider = _facts([1, 2, 3, 4, 5, 6])
+    _stub(mod, monkeypatch, provider)
+    monkeypatch.setattr(mod, "_rerank", lambda q, fused: (list(reversed(fused)), True))
+    monkeypatch.setattr(mod.factkit.holo, "fuse_results", lambda *a, **k: list(provider))
+    out = mod.on_transform_tool_result(
+        tool_name="fact_store",
+        args={"action": "search", "query": "q", "limit": 4},
+        result=json.dumps({"results": provider, "count": len(provider)}),
+    )
+    data = json.loads(out)
+    assert [f["fact_id"] for f in data["results"]] == [6, 5, 4, 3]
+    assert data["count"] == 4
+    assert data["ranking"] == "reranked"
+
+
+def test_limit_is_clamped_to_50(tmp_path, monkeypatch):
+    mod = _load(tmp_path)
+    provider = _facts([1, 2, 3])
+    _, calls = _run(mod, monkeypatch, provider, provider, limit=500)
+    assert calls[-1]["limit"] == 50
+
+
+def test_limit_accepts_numeric_string(tmp_path, monkeypatch):
+    mod = _load(tmp_path)
+    provider = _facts([1, 2, 3])
+    data, calls = _run(mod, monkeypatch, provider, provider, limit="2")
+    assert calls[-1]["limit"] == 2
+    assert [f["fact_id"] for f in data["results"]] == [1, 2]
+
+
+def test_invalid_limit_falls_back_to_default(tmp_path, monkeypatch):
+    mod = _load(tmp_path)
+    provider = _facts([1, 2, 3])
+    _, calls = _run(mod, monkeypatch, provider, provider, limit="abc")
+    assert calls[-1]["limit"] == 3
+
+
+def test_negative_limit_clamped_to_one(tmp_path, monkeypatch):
+    mod = _load(tmp_path)
+    provider = _facts([1, 2, 3])
+    data, calls = _run(mod, monkeypatch, provider, provider, limit=-5)
+    assert calls[-1]["limit"] == 1
+    assert len(data["results"]) == 1
