@@ -1,39 +1,61 @@
 """Circuit-breaker tests for the factkit Hermes plugin.
 
-The plugin lives outside this repo, so it is loaded by path as package
-``fkplugin`` (with the plugin directory as the search location) to make its
-relative ``from .factkit import holo`` imports resolve. No store is opened,
-no embedder is contacted: prefetch is always patched.
+The plugin is loaded from a temporary copy of this repo's
+``integrations/hermes/factkit`` package, mirroring the installed layout (entry
+point plus vendored ``factkit`` modules) under a unique module name so its
+relative ``from .factkit import holo`` imports resolve. No installed plugin is
+required, no store is opened, no embedder is contacted: prefetch is patched.
 """
 from __future__ import annotations
 
 import importlib
 import importlib.util
+import pathlib
 import sys
+import tempfile
 import time
 from unittest.mock import Mock
 
 import pytest
 
-PLUGIN = "/home/melsiddig/.hermes/plugins/factkit/__init__.py"
-PLUGIN_DIR = "/home/melsiddig/.hermes/plugins/factkit"
+REPO = pathlib.Path(__file__).resolve().parents[1]
+SOURCE = REPO / "integrations/hermes/factkit/plugin_init.py"
+
+# Keep the temporary directory alive for the whole module: the loaded modules
+# no longer need the files, but cleanup happens when the interpreter exits.
+_TMP = tempfile.TemporaryDirectory(prefix="fkbreaker-")
+PLUGIN_DIR = pathlib.Path(_TMP.name) / "plugin"
+PLUGIN = PLUGIN_DIR / "__init__.py"
+PLUGIN_MODULE = f"fkplugin{abs(id(_TMP))}"
 
 QUERY = "what are the specs of my atlas server"
 BREAKER_SECONDS = 300.0
 
 
+def _prepare():
+    """Write a throwaway copy of the plugin: entry point plus vendored modules."""
+    (PLUGIN_DIR / "factkit").mkdir(parents=True)
+    PLUGIN.write_text(SOURCE.read_text())
+    (PLUGIN_DIR / "factkit/__init__.py").write_text('__all__ = ["holo"]\n')
+    for name in ("config", "embed", "vectors", "units", "maintenance", "holo"):
+        (PLUGIN_DIR / f"factkit/{name}.py").write_text(
+            (REPO / f"factkit/{name}.py").read_text()
+        )
+
+
 def _load_plugin():
+    _prepare()
     spec = importlib.util.spec_from_file_location(
-        "fkplugin", PLUGIN, submodule_search_locations=[PLUGIN_DIR]
+        PLUGIN_MODULE, PLUGIN, submodule_search_locations=[str(PLUGIN_DIR)]
     )
     module = importlib.util.module_from_spec(spec)
-    sys.modules["fkplugin"] = module
+    sys.modules[PLUGIN_MODULE] = module
     spec.loader.exec_module(module)
     return module
 
 
 m = _load_plugin()
-holo = importlib.import_module("fkplugin.factkit.holo")
+holo = importlib.import_module(f"{PLUGIN_MODULE}.factkit.holo")
 
 
 @pytest.fixture(autouse=True)

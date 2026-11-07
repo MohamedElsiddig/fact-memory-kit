@@ -26,3 +26,9 @@ factkit = "factkit.cli:main"
 
 [tool.setuptools.packages.find]
 include = ["factkit*"]
+
+[tool.pytest.ini_options]
+markers = [
+  "provider: tests that require an installed Hermes/holographic provider or plugin",
+  "slow: slow tests",
+]
