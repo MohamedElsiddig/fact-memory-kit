@@ -30,30 +30,31 @@ repo="$(cd "$here/../../.." && pwd)"
 plugins="${HERMES_PLUGINS:-$HOME/.hermes/plugins}"
 dest="$plugins/factkit"
 
-# vendored files: installed path -> repo source
-labels=(__init__.py plugin.yaml factkit/config.py factkit/embed.py factkit/vectors.py factkit/units.py factkit/embedcache.py factkit/maintenance.py factkit/holo.py)
-sources=(
-  "$here/plugin_init.py"
-  "$here/plugin.yaml"
-  "$repo/factkit/config.py"
-  "$repo/factkit/embed.py"
-  "$repo/factkit/vectors.py"
-  "$repo/factkit/units.py"
-  "$repo/factkit/embedcache.py"
-  "$repo/factkit/maintenance.py"
-  "$repo/factkit/holo.py"
+manifest="$here/manifest.txt"
+if [ ! -f "$manifest" ]; then
+  echo "install.sh: manifest not found: $manifest" >&2
+  exit 2
+fi
+
+mapfile -t entries < <(
+  while IFS= read -r line || [ -n "$line" ]; do
+    line="${line%%#*}"
+    line="${line#"${line%%[![:space:]]*}"}"
+    line="${line%"${line##*[![:space:]]}"}"
+    [ -n "$line" ] && printf '%s\n' "$line"
+  done < "$manifest"
 )
-targets=(
-  "$dest/__init__.py"
-  "$dest/plugin.yaml"
-  "$dest/factkit/config.py"
-  "$dest/factkit/embed.py"
-  "$dest/factkit/vectors.py"
-  "$dest/factkit/units.py"
-  "$dest/factkit/embedcache.py"
-  "$dest/factkit/maintenance.py"
-  "$dest/factkit/holo.py"
-)
+
+# installed path (relative to $dest) -> repo source
+source_for() {
+  case "$1" in
+    __init__.py) printf '%s\n' "$here/plugin_init.py" ;;
+    plugin.yaml) printf '%s\n' "$here/plugin.yaml" ;;
+    manifest.txt) printf '%s\n' "$here/manifest.txt" ;;
+    factkit/*.py) printf '%s\n' "$repo/$1" ;;
+    *) printf '%s\n' "" ;;
+  esac
+}
 
 sha256() {
   if command -v sha256sum >/dev/null 2>&1; then
@@ -65,27 +66,67 @@ sha256() {
 
 if [ "$check" -eq 1 ]; then
   drift=0
-  for i in "${!labels[@]}"; do
-    label="${labels[$i]}"
-    src="${sources[$i]}"
-    dst="${targets[$i]}"
-    if [ ! -f "$src" ]; then
-      echo "DRIFT $label"
-      echo "  missing repo source: $src" >&2
+  declare -A in_manifest=()
+  for rel in "${entries[@]}"; do
+    in_manifest["$rel"]=1
+    src="$(source_for "$rel")"
+    dst="$dest/$rel"
+    if [ -z "$src" ] || [ ! -f "$src" ]; then
+      echo "DRIFT $rel"
+      echo "  missing repo source: ${src:-<unmapped>}" >&2
       drift=1
       continue
     fi
     if [ ! -f "$dst" ]; then
-      echo "DRIFT $label"
+      echo "DRIFT $rel"
       echo "  missing installed copy: $dst" >&2
       drift=1
       continue
     fi
     if [ "$(sha256 "$src")" != "$(sha256 "$dst")" ]; then
-      echo "DRIFT $label"
+      echo "DRIFT $rel"
       drift=1
     fi
   done
+
+  # generated entry point; not in the manifest but plugin-status checks it too
+  if [ ! -f "$dest/factkit/__init__.py" ]; then
+    echo "DRIFT factkit/__init__.py"
+    echo "  missing generated copy: $dest/factkit/__init__.py" >&2
+    drift=1
+  fi
+
+  # extra files in the plugin root: seeded config and bytecode are expected
+  if [ -d "$dest" ]; then
+    for f in "$dest"/*; do
+      [ -f "$f" ] || continue
+      base="$(basename "$f")"
+      case "$base" in
+        config.yaml|config.example.yaml|*.pyc|__pycache__) continue ;;
+      esac
+      if [ -z "${in_manifest[$base]+x}" ]; then
+        echo "DRIFT $base"
+        drift=1
+      fi
+    done
+  fi
+
+  # extra files in the vendored package: generated entry point is expected
+  if [ -d "$dest/factkit" ]; then
+    for f in "$dest/factkit"/*; do
+      [ -f "$f" ] || continue
+      base="$(basename "$f")"
+      case "$base" in
+        __init__.py|*.pyc|__pycache__) continue ;;
+      esac
+      rel="factkit/$base"
+      if [ -z "${in_manifest[$rel]+x}" ]; then
+        echo "DRIFT $rel"
+        drift=1
+      fi
+    done
+  fi
+
   if [ "$drift" -eq 0 ]; then
     echo "OK"
     exit 0
@@ -96,13 +137,15 @@ fi
 
 mkdir -p "$dest/factkit"
 
-# plugin entry point + manifest
-cp "$here/plugin_init.py" "$dest/__init__.py"
-cp "$here/plugin.yaml" "$dest/plugin.yaml"
-
-# vendored subset: holo machinery only, no CLI or server
-for f in config.py embed.py vectors.py units.py embedcache.py maintenance.py holo.py; do
-  cp "$repo/factkit/$f" "$dest/factkit/$f"
+# manifest-driven copy: plugin entry point, manifest, and vendored modules
+for rel in "${entries[@]}"; do
+  src="$(source_for "$rel")"
+  if [ -z "$src" ]; then
+    echo "install.sh: no source mapping for manifest entry: $rel" >&2
+    exit 2
+  fi
+  mkdir -p "$(dirname "$dest/$rel")"
+  cp "$src" "$dest/$rel"
 done
 cat > "$dest/factkit/__init__.py" <<'PY'
 """Minimal factkit subset bundled with the Hermes plugin (holo + helpers)."""
