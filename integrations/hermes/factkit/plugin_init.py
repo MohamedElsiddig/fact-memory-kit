@@ -19,6 +19,8 @@ Environment:
   FACTKIT_PREFETCH=0        disable the context block
   FACTKIT_PREFETCH_LIMIT=3  max facts injected
   FACTKIT_PREFETCH_MIN=0.55 minimum cosine
+  FACTKIT_RERANK=1          re-rank fused tool results (config key: ``rerank``;
+                            off by default, ``rerank_min_gain`` sets the bar)
   FACTKIT_INDEX=0           disable session-end indexing
   FACTKIT_DB=...            override the store path (also ``db:`` in config)
 """
@@ -214,6 +216,69 @@ _apply_embed_env()
 def _merge_enabled() -> bool:
     value = _config().get("merge_results", os.environ.get("FACTKIT_MERGE", "1"))
     return str(value).lower() not in ("0", "false", "no")
+
+
+_RERANK_ON = ("1", "true", "yes", "on")
+
+
+def _rerank_enabled() -> bool:
+    """Embedding-mode re-rank of fused hits. Off unless explicitly enabled."""
+    env = os.environ.get("FACTKIT_RERANK")
+    if env is not None:
+        return str(env).strip().lower() in _RERANK_ON
+    return str(_config().get("rerank", "0")).strip().lower() in _RERANK_ON
+
+
+def _rerank_client():
+    """Embedding client for the re-rank, or None when it is not configured."""
+    cfg = _config()
+    base_url = str(cfg.get("embed_base_url") or "")
+    model = str(cfg.get("embed_model") or "")
+    if not base_url or not model:
+        return None
+    from .factkit.embed import EmbeddingClient
+
+    # One short attempt: the re-rank has its own 250 ms budget and must not
+    # spend it on retries or on a slow endpoint.
+    return EmbeddingClient(
+        base_url=base_url,
+        model=model,
+        api_key=str(cfg.get("embed_api_key") or ""),
+        timeout=0.25,
+        retries=0,
+    )
+
+
+def _rerank(query: str, fused: list) -> tuple[list, bool]:
+    """Re-rank the fused hits; ``(hits, reranked)``. Never raises, never trips
+    the breaker: a re-rank problem leaves the fused order untouched."""
+    if not _rerank_enabled() or len(fused) < 2:
+        return fused, False
+    try:
+        from .factkit import rerank as reranker
+
+        client = _rerank_client()
+        if client is None:
+            return fused, False
+        result = reranker.rerank(
+            None,
+            query,
+            fused,
+            mode="embedding",
+            embed_client=client,
+            timeout_ms=250.0,
+            min_gain=_num("rerank_min_gain", 0.01),
+        )
+    except Exception as exc:  # noqa: BLE001 - recall must never break a turn
+        logger.debug("factkit rerank skipped: %s", exc)
+        return fused, False
+    if (
+        isinstance(result, dict)
+        and result.get("reranked")
+        and isinstance(result.get("hits"), list)
+    ):
+        return result["hits"], True
+    return fused, False
 
 
 def _skip(message: str) -> bool:
@@ -580,10 +645,11 @@ def on_transform_tool_result(tool_name: str = "", args=None, result=None, **kwar
         _breaker_trip()
         return None
     _breaker_reset()
+    merged, reranked = _rerank(query, merged)
     _remember((f["content"] for f in merged if f.get("content")), _session_key(kwargs))
     payload[key] = merged
     payload["count"] = len(merged)
-    payload["ranking"] = "fused"
+    payload["ranking"] = "reranked" if reranked else "fused"
     return json.dumps(payload)
 
 

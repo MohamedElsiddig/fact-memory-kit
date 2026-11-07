@@ -9,5 +9,6 @@ factkit/embed.py
 factkit/vectors.py
 factkit/units.py
 factkit/embedcache.py
+factkit/rerank.py
 factkit/maintenance.py
 factkit/holo.py

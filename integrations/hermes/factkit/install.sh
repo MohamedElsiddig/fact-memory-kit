@@ -148,8 +148,8 @@ for rel in "${entries[@]}"; do
   cp "$src" "$dest/$rel"
 done
 cat > "$dest/factkit/__init__.py" <<'PY'
-"""Minimal factkit subset bundled with the Hermes plugin (holo + helpers)."""
-__all__ = ["holo"]
+"""Minimal factkit subset bundled with the Hermes plugin (holo + rerank + helpers)."""
+__all__ = ["holo", "rerank"]
 __version__ = "0.1.0"
 PY
 

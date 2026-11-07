@@ -4,3 +4,8 @@ embed_model: text-embedding-nomic-embed-text-v1.5
 prefetch: true
 limit: 3
 min_score: 0.55
+# Embedding-mode re-rank of fused hits. Off by default: costs an embedding
+# round trip on every turn.
+rerank: false
+# Minimum gain a re-rank must show; below this the original order is kept.
+rerank_min_gain: 0.01
