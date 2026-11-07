@@ -64,6 +64,16 @@ sha256() {
   fi
 }
 
+# files owned by the plugin's own update channel, not by this manifest:
+# they may legitimately appear next to an installed copy and are not drift
+is_dist_owned() {
+  case "$1" in
+    update.yaml|README.md|LICENSE|config.yaml.example|config.example.yaml|config.yaml|*.pyc|__pycache__)
+      return 0 ;;
+  esac
+  return 1
+}
+
 if [ "$check" -eq 1 ]; then
   drift=0
   declare -A in_manifest=()
@@ -96,14 +106,17 @@ if [ "$check" -eq 1 ]; then
     drift=1
   fi
 
-  # extra files in the plugin root: seeded config and bytecode are expected
+  # extra files in the plugin root: seeded config, dist-owned files and bytecode are expected
   if [ -d "$dest" ]; then
     for f in "$dest"/*; do
       [ -f "$f" ] || continue
       base="$(basename "$f")"
-      case "$base" in
-        config.yaml|config.example.yaml|*.pyc|__pycache__) continue ;;
-      esac
+      if is_dist_owned "$base"; then
+        if [ "${FACTKIT_CHECK_VERBOSE:-0}" = "1" ]; then
+          echo "IGNORED $base"
+        fi
+        continue
+      fi
       if [ -z "${in_manifest[$base]+x}" ]; then
         echo "DRIFT $base"
         drift=1
@@ -111,14 +124,17 @@ if [ "$check" -eq 1 ]; then
     done
   fi
 
-  # extra files in the vendored package: generated entry point is expected
+  # extra files in the vendored package: generated entry point and dist-owned files are expected
   if [ -d "$dest/factkit" ]; then
     for f in "$dest/factkit"/*; do
       [ -f "$f" ] || continue
       base="$(basename "$f")"
-      case "$base" in
-        __init__.py|*.pyc|__pycache__) continue ;;
-      esac
+      if [ "$base" = "__init__.py" ] || is_dist_owned "$base"; then
+        if [ "${FACTKIT_CHECK_VERBOSE:-0}" = "1" ]; then
+          echo "IGNORED factkit/$base"
+        fi
+        continue
+      fi
       rel="factkit/$base"
       if [ -z "${in_manifest[$rel]+x}" ]; then
         echo "DRIFT $rel"

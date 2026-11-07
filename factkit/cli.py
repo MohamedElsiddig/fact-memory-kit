@@ -78,6 +78,14 @@ def _manifest_source(repo: Path, rel: str) -> Path | None:
     return None
 
 
+# files owned by the plugin's own update channel rather than by this manifest:
+# they may legitimately sit next to an installed copy and are not drift
+_DIST_OWNED = {
+    "update.yaml", "README.md", "LICENSE", "config.yaml.example",
+    "config.example.yaml", "config.yaml",
+}
+
+
 def index_embeddings(store: Store, cfg: Config, *, batch_report: bool = True,
                      only_missing: bool = True) -> dict:
     client = _embedder(cfg)
@@ -540,10 +548,10 @@ def cmd_plugin_status(args) -> int:
         "status": "match" if generated_sha is not None else "missing",
     })
 
-    # files the installer did not put there (bytecode and seeded config aside)
-    known = set(entries) | {
-        "factkit/__init__.py", "config.yaml", "config.example.yaml",
-    }
+    # files the installer did not put there (bytecode, seeded config and
+    # dist-owned files aside)
+    known = set(entries) | {"factkit/__init__.py"}
+    ignored = []
     for base, prefix in ((installed, ""), (installed / "factkit", "factkit/")):
         if not base.is_dir():
             continue
@@ -554,6 +562,9 @@ def cmd_plugin_status(args) -> int:
                 continue
             rel = f"{prefix}{child.name}"
             if rel in known:
+                continue
+            if child.name in _DIST_OWNED:
+                ignored.append(rel)
                 continue
             rows.append({
                 "name": rel,
@@ -567,11 +578,15 @@ def cmd_plugin_status(args) -> int:
     drift = any(row["status"] != "match" for row in rows)
     verdict = "DRIFT" if drift else "MATCH"
     version = _plugin_version(installed / "plugin.yaml")
+    verbose = os.environ.get("FACTKIT_CHECK_VERBOSE") == "1"
 
     if args.json:
-        _print_json({"installed": True, "installed_path": str(installed),
-                     "repo_root": str(repo), "version": version,
-                     "verdict": verdict, "files": rows})
+        payload = {"installed": True, "installed_path": str(installed),
+                   "repo_root": str(repo), "version": version,
+                   "verdict": verdict, "files": rows}
+        if verbose:
+            payload["ignored"] = ignored
+        _print_json(payload)
     else:
         print(f"plugin   {installed}")
         print(f"version  {version}")
@@ -581,6 +596,9 @@ def cmd_plugin_status(args) -> int:
         for row in rows:
             print(f"{row['name']:<20} {row['repo_sha256'] or '-':<64} "
                   f"{row['installed_sha256'] or '-':<64} {row['status']}")
+        if verbose:
+            for rel in ignored:
+                print(f"ignored  {rel}")
         print()
         print(f"verdict  {verdict}")
     return 1 if drift else 0

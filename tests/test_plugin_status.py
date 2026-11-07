@@ -14,6 +14,7 @@ INSTALL = REPO / "integrations" / "hermes" / "factkit" / "install.sh"
 
 def _run(args, env: dict | None = None):
     full = dict(os.environ)
+    full.pop("FACTKIT_CHECK_VERBOSE", None)
     full.update(env or {})
     return subprocess.run(args, cwd=REPO, env=full, text=True, capture_output=True)
 
@@ -88,3 +89,65 @@ def test_plugin_status_missing_install_exits_two(tmp_path):
     assert res.returncode == 2
     assert "not installed" in res.stderr
     assert "Traceback" not in res.stderr
+
+
+DIST_OWNED = ("update.yaml", "README.md", "LICENSE", "config.yaml.example")
+
+
+def test_check_ignores_dist_owned_extras(tmp_path):
+    dest, env = _install(tmp_path)
+    for name in DIST_OWNED:
+        (dest / name).write_text("# dist-owned\n", encoding="utf-8")
+
+    res = _run(["bash", str(INSTALL), "--check"], env=env)
+    assert res.returncode == 0, res.stdout + res.stderr
+    assert res.stdout.strip() == "OK"
+
+
+def test_plugin_status_ignores_dist_owned_extras(tmp_path):
+    dest, env = _install(tmp_path)
+    for name in DIST_OWNED:
+        (dest / name).write_text("# dist-owned\n", encoding="utf-8")
+
+    res = _status(env)
+    assert res.returncode == 0, res.stdout + res.stderr
+    assert "verdict  MATCH" in res.stdout
+
+    payload = json.loads(_status(env, "--json").stdout)
+    assert payload["verdict"] == "MATCH"
+    names = {row["name"] for row in payload["files"]}
+    assert not names & set(DIST_OWNED)
+
+
+def test_unknown_extra_still_reports_drift(tmp_path):
+    dest, env = _install(tmp_path)
+    (dest / "rogue.txt").write_text("not managed\n", encoding="utf-8")
+
+    res = _run(["bash", str(INSTALL), "--check"], env=env)
+    assert res.returncode == 1
+    assert "DRIFT rogue.txt" in res.stdout
+
+    res = _status(env)
+    assert res.returncode == 1
+    assert "verdict  DRIFT" in res.stdout
+
+    payload = json.loads(_status(env, "--json").stdout)
+    statuses = {row["name"]: row["status"] for row in payload["files"]}
+    assert statuses["rogue.txt"] == "extra"
+
+
+def test_verbose_lists_ignored_dist_owned_extras(tmp_path):
+    dest, env = _install(tmp_path)
+    (dest / "update.yaml").write_text("# dist-owned\n", encoding="utf-8")
+
+    res = _run(
+        ["bash", str(INSTALL), "--check"], env={**env, "FACTKIT_CHECK_VERBOSE": "1"}
+    )
+    assert res.returncode == 0
+    assert "IGNORED update.yaml" in res.stdout
+    assert res.stdout.strip().splitlines()[-1] == "OK"
+
+    res = _status({**env, "FACTKIT_CHECK_VERBOSE": "1"}, "--json")
+    payload = json.loads(res.stdout)
+    assert payload["verdict"] == "MATCH"
+    assert "update.yaml" in payload["ignored"]
