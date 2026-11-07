@@ -211,3 +211,49 @@ def test_negative_limit_clamped_to_one(tmp_path, monkeypatch):
     data, calls = _run(mod, monkeypatch, provider, provider, limit=-5)
     assert calls[-1]["limit"] == 1
     assert len(data["results"]) == 1
+
+
+def test_empty_results_list_returns_original(tmp_path, monkeypatch):
+    mod = _load(tmp_path)
+    _stub(mod, monkeypatch, [{"fact_id": 1, "content": "one"}])
+    assert mod.on_transform_tool_result(
+        tool_name="fact_store",
+        args={"action": "search", "query": "q"},
+        result=json.dumps({"results": [], "count": 0}),
+    ) is None
+
+
+def test_missing_limit_uses_configured_value(tmp_path, monkeypatch):
+    mod = _load(tmp_path)
+    provider = _facts([1, 2, 3])
+    calls = []
+    _stub(mod, monkeypatch, provider)
+    monkeypatch.setattr(mod, "_rerank_enabled", lambda: False)
+    monkeypatch.setattr(mod, "_num", lambda key, default: 7 if key == "limit" else default)
+    monkeypatch.setattr(mod.factkit.holo, "fuse_results",
+                        lambda *a, **k: calls.append(k) or [dict(f) for f in provider])
+    out = mod.on_transform_tool_result(
+        tool_name="fact_store",
+        args={"action": "search", "query": "q"},
+        result=json.dumps({"results": provider, "count": len(provider)}),
+    )
+    assert calls[-1]["limit"] == 7
+    assert json.loads(out)["count"] == 3
+
+
+def test_remember_only_sees_emitted_rows(tmp_path, monkeypatch):
+    mod = _load(tmp_path)
+    provider = _facts([1, 2, 3, 4, 5, 6])
+    seen = []
+    _stub(mod, monkeypatch, provider)
+    monkeypatch.setattr(mod, "_rerank", lambda q, fused: (fused, False))
+    monkeypatch.setattr(mod, "_mark_seen",
+                        lambda contents, session=None: seen.extend(contents))
+    monkeypatch.setattr(mod.factkit.holo, "fuse_results", lambda *a, **k: list(provider))
+    out = mod.on_transform_tool_result(
+        tool_name="fact_store",
+        args={"action": "search", "query": "q", "limit": 3},
+        result=json.dumps({"results": provider, "count": len(provider)}),
+    )
+    assert [f["fact_id"] for f in json.loads(out)["results"]] == [1, 2, 3]
+    assert seen == ["fact 1", "fact 2", "fact 3"]
