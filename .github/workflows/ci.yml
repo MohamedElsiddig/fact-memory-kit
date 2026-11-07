@@ -6,7 +6,9 @@ on:
   pull_request:
 
 jobs:
-  test:
+  # No Hermes/holographic provider, no network: the suite must pass on a bare
+  # runner. Provider-dependent tests are opt-in via ``-m provider``.
+  unit:
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
@@ -21,8 +23,8 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -e . pytest
-      - name: unit + integration tests
-        run: pytest -q
+      - name: unit tests (no provider)
+        run: pytest -q -m "not provider"
       - name: golden gate smoke (offline, demo corpus)
         run: |
           export FACTKIT_DB="$RUNNER_TEMP/facts.db"
@@ -40,3 +42,30 @@ jobs:
           factkit route "what are my laptop specs"
           factkit export --format csv --out "$RUNNER_TEMP/facts.csv"
           factkit import "$RUNNER_TEMP/facts.csv" --dry-run
+
+  # Installs the companion plugin into a throwaway HERMES_PLUGINS directory and
+  # exercises the plugin/merge behaviour against it. Still no provider daemon
+  # and no network.
+  plugin:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e . pytest
+      - name: install plugin into temp HERMES_PLUGINS
+        env:
+          HERMES_PLUGINS: ${{ runner.temp }}/hermes-plugins
+        run: bash integrations/hermes/factkit/install.sh
+      - name: verify installed plugin matches checkout
+        env:
+          HERMES_PLUGINS: ${{ runner.temp }}/hermes-plugins
+        run: bash integrations/hermes/factkit/install.sh --check
+      - name: plugin + merge tests
+        env:
+          HERMES_PLUGINS: ${{ runner.temp }}/hermes-plugins
+        run: pytest -q tests/test_breaker.py tests/test_plugin_merge.py

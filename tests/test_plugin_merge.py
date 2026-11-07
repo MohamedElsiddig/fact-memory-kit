@@ -5,7 +5,7 @@ import pathlib
 import json
 import sys
 
-REPO = pathlib.Path("/home/melsiddig/workspace/fact-memory-kit")
+REPO = pathlib.Path(__file__).resolve().parents[1]
 SOURCE = REPO / "integrations/hermes/factkit/plugin_init.py"
 
 

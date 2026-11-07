@@ -423,7 +423,7 @@ def test_conflict_ignores_different_attributes(tmp_path):
 def test_conflict_ignores_shared_place_only(tmp_path):
     db = _holo_db(tmp_path / "h.db", [
         ("Car registered in Abu Dhabi, VIN X, file ~/wikis/car/a.md", "2026-01-01 00:00:00"),
-        ("Engineer in Abu Dhabi, CV at /home/u/cv.pdf", "2026-06-01 00:00:00"),
+        ("Engineer in Abu Dhabi, CV at /srv/example/cv.pdf", "2026-06-01 00:00:00"),
     ], [("Abu Dhabi", "unknown", [1, 2])])
     assert holo.find_conflicts(db) == []
 

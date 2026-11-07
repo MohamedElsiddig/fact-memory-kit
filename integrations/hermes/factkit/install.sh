@@ -9,7 +9,7 @@ usage() {
   cat <<'USAGE'
 usage: install.sh [--check]
 
-  (no args)  install or refresh ~/.hermes/plugins/factkit
+  (no args)  install or refresh $HOME/.hermes/plugins/factkit
   --check    compare the installed plugin files with this checkout; prints
              OK, or one DRIFT <file> line per mismatch, and exits 1 on drift.
              Never writes anything.

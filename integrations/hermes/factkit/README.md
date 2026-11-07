@@ -16,14 +16,14 @@ bash integrations/hermes/factkit/install.sh
 hermes plugins enable factkit
 ```
 
-`install.sh` copies the plugin into `~/.hermes/plugins/factkit` and vendors the
+`install.sh` copies the plugin into `$HOME/.hermes/plugins/factkit` and vendors the
 five factkit modules it needs. Re-run it after updating the repo.
 
 ## Configure
 
 ```bash
-cp ~/.hermes/plugins/factkit/config.example.yaml ~/.hermes/plugins/factkit/config.yaml
-chmod 600 ~/.hermes/plugins/factkit/config.yaml
+cp "$HOME/.hermes/plugins/factkit/config.example.yaml" "$HOME/.hermes/plugins/factkit/config.yaml"
+chmod 600 "$HOME/.hermes/plugins/factkit/config.yaml"
 ```
 
 | key | default | meaning |
