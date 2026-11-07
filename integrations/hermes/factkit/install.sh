@@ -31,7 +31,7 @@ plugins="${HERMES_PLUGINS:-$HOME/.hermes/plugins}"
 dest="$plugins/factkit"
 
 # vendored files: installed path -> repo source
-labels=(__init__.py plugin.yaml factkit/config.py factkit/embed.py factkit/vectors.py factkit/units.py factkit/embedcache.py factkit/maintenance.py factkit/holo.py)
+labels=(__init__.py plugin.yaml factkit/config.py factkit/embed.py factkit/vectors.py factkit/units.py factkit/embedcache.py factkit/maintenance.py factkit/holo.py factkit/rerank.py)
 sources=(
   "$here/plugin_init.py"
   "$here/plugin.yaml"
@@ -42,6 +42,7 @@ sources=(
   "$repo/factkit/embedcache.py"
   "$repo/factkit/maintenance.py"
   "$repo/factkit/holo.py"
+  "$repo/factkit/rerank.py"
 )
 targets=(
   "$dest/__init__.py"
@@ -53,6 +54,7 @@ targets=(
   "$dest/factkit/embedcache.py"
   "$dest/factkit/maintenance.py"
   "$dest/factkit/holo.py"
+  "$dest/factkit/rerank.py"
 )
 
 sha256() {
@@ -100,13 +102,13 @@ mkdir -p "$dest/factkit"
 cp "$here/plugin_init.py" "$dest/__init__.py"
 cp "$here/plugin.yaml" "$dest/plugin.yaml"
 
-# vendored subset: holo machinery only, no CLI or server
-for f in config.py embed.py vectors.py units.py embedcache.py maintenance.py holo.py; do
+# vendored subset: holo + rerank machinery only, no CLI or server
+for f in config.py embed.py vectors.py units.py embedcache.py maintenance.py holo.py rerank.py; do
   cp "$repo/factkit/$f" "$dest/factkit/$f"
 done
 cat > "$dest/factkit/__init__.py" <<'PY'
-"""Minimal factkit subset bundled with the Hermes plugin (holo + helpers)."""
-__all__ = ["holo"]
+"""Minimal factkit subset bundled with the Hermes plugin (holo + rerank + helpers)."""
+__all__ = ["holo", "rerank"]
 __version__ = "0.1.0"
 PY
 
