@@ -307,14 +307,35 @@ ones with a measured downside say so.
 - **HRR** (`hrr.py`) is a candidate re-ranker with a benchmark harness. On the
   current corpus it beats lexical on MRR but not hit@5, so the bench exits 1 and
   nothing is wired into the hook. Wire it only when the A/B wins both.
-- **Cross-encoder rerank** (`rerank.py`) is opt-in and budgeted: with a local
-  7B-class model it measured ~2.3 s for 5 hits, so it correctly returns
-  `reason: "no_gain"`/timeout and keeps the original order. Do not enable it in
-  the 250 ms hook path.
+- **Rerank** (`rerank.py`) has two modes and stays off (`rerank: false`).
+  `llm` mode measured ~2.3 s for five hits. `embedding` mode is wired into
+  `transform_tool_result` with a 250 ms deadline, but on the live corpus it
+  timed out on 25/25 cases (mean 330 ms, prefetch 163 ms), so hit@5 and MRR did
+  not move (0.800/0.768). `scripts/rerank_ab.py` exits 1 on no gain: leave it off
+  unless you raise the budget and can pay the latency, or precompute candidate
+  vectors so the hook only embeds the query.
 - **Namespaces** (`namespaces.py`) detects the store shape. The live provider has
   `memory_banks`, but only as a category-level vector cache with no fact->bank
   membership, so namespaces are the `ns:<name>` tag convention. Scoping is a
   post-filter: a small namespace returns fewer than `limit`.
+
+## Operational hardening
+
+- **Hooks never create the store.** The companion checks that the database
+  exists before opening it; a missing store disables recall with one warning
+  instead of creating an empty database beside the real one.
+- **One cached handle per path**, closed on `on_session_end` (twice-safe).
+- **Dedupe is per session**: a fact already injected earlier in the same
+  conversation is skipped, and the next session starts clean.
+- **`health()`** exposes `{recall_failures, embed_failures, breaker_open,
+  last_error}` for the plugin; the first failure of each kind logs at WARNING.
+- **One vendored-file manifest.** `integrations/hermes/factkit/manifest.txt` is
+  read by both `install.sh` and `factkit plugin-status`, so they cannot disagree.
+  Dist-owned extras (`update.yaml`, `README.md`, `LICENSE`, config examples) are
+  ignored by the drift check; a missing or modified managed file is still DRIFT.
+- **Tests do not depend on this host.** The plugin is loaded from
+  `integrations/hermes/factkit` into a temp package, CI runs `unit` and `plugin`
+  jobs separately, and `tests/test_no_host_paths.py` fails on any `/home/` path.
 
 ## Hybrid results
 

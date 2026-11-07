@@ -211,6 +211,15 @@ Rules:
   refuses to delete the last model.
 * `relations.infer` and `ns` listing are proposals/read-only; `link` is the only
   write and it is explicit.
+* The vendored-file list lives in `integrations/hermes/factkit/manifest.txt` and
+  is read by both `install.sh` and `factkit plugin-status`. Add a module there,
+  not to parallel arrays; `--check` must print `OK` before any version bump.
+* Hooks must never create the store: a missing database disables recall (one
+  warning) rather than creating an empty one. Handles are cached per path and
+  closed on session end; dedupe is session-keyed.
+* `rerank` is off by default. Embedding mode is wired at a 250 ms deadline and
+  timed out 25/25 on the live corpus, so enabling it changes nothing; `llm` mode
+  costs ~2.3 s. Do not turn it on without new A/B numbers.
 * Smoke-case ids in `examples/smoke_cases.json` are placeholders; replace them
   with ids from the store being guarded or the gate checks nothing.
 * `bridge` requires an LLM endpoint and is opt-in; proposals are deduped.
