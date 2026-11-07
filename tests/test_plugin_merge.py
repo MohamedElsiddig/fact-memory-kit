@@ -85,3 +85,72 @@ def test_no_list_key_returns_original(tmp_path, monkeypatch):
     assert mod.on_transform_tool_result(tool_name="fact_store",
                                         args={"action": "search", "query": "q"},
                                         result=json.dumps({"count": 0})) is None
+
+
+def _facts(ids):
+    return [{"fact_id": i, "content": f"fact {i}", "score": round(1.0 - i / 100, 3)}
+            for i in ids]
+
+
+def _run(mod, monkeypatch, provider, fused, limit=None):
+    """Run the hook with a spying fuse_results; return (payload, recorded kwargs)."""
+    _stub(mod, monkeypatch, fused)
+    monkeypatch.setattr(mod, "_rerank_enabled", lambda: False)
+    calls = []
+
+    def fake(*args, **kwargs):
+        calls.append(kwargs)
+        return [dict(fact) for fact in fused]
+
+    monkeypatch.setattr(mod.factkit.holo, "fuse_results", fake)
+    args = {"action": "search", "query": "q"}
+    if limit is not None:
+        args["limit"] = limit
+    out = mod.on_transform_tool_result(
+        tool_name="fact_store",
+        args=args,
+        result=json.dumps({"results": provider, "count": len(provider)}),
+    )
+    return json.loads(out), calls
+
+
+def test_provider_limit_3_returns_exactly_3(tmp_path, monkeypatch):
+    mod = _load(tmp_path)
+    provider = _facts([1, 2, 3])
+    data, calls = _run(mod, monkeypatch, provider, provider, limit=3)
+    assert [f["fact_id"] for f in data["results"]] == [1, 2, 3]
+    assert data["count"] == 3
+    assert calls[-1]["limit"] == 3
+
+
+def test_provider_3_limit_5_allows_semantic_add(tmp_path, monkeypatch):
+    mod = _load(tmp_path)
+    provider = _facts([1, 2, 3])
+    semantic = [{"fact_id": 10, "content": "semantic ten", "score": 0.2,
+                 "source": "semantic"},
+                {"fact_id": 11, "content": "semantic eleven", "score": 0.1,
+                 "source": "semantic"}]
+    data, calls = _run(mod, monkeypatch, provider, provider + semantic, limit=5)
+    ids = [f["fact_id"] for f in data["results"]]
+    assert len(ids) == 5
+    assert {1, 2, 3}.issubset(ids)
+    assert len(ids) - len(provider) <= 2
+    assert calls[-1]["limit"] == 5
+
+
+def test_provider_6_limit_4_first_four_provider_order(tmp_path, monkeypatch):
+    mod = _load(tmp_path)
+    provider = _facts([1, 2, 3, 4, 5, 6])
+    data, calls = _run(mod, monkeypatch, provider, provider[:4], limit=4)
+    assert [f["fact_id"] for f in data["results"]] == [1, 2, 3, 4]
+    assert data["count"] == 4
+    assert calls[-1]["limit"] == 4
+
+
+def test_no_limit_falls_back_to_config_limit(tmp_path, monkeypatch):
+    mod = _load(tmp_path)
+    provider = _facts([1, 2, 3])
+    data, calls = _run(mod, monkeypatch, provider, provider)
+    assert [f["fact_id"] for f in data["results"]] == [1, 2, 3]
+    assert data["count"] == 3
+    assert calls[-1]["limit"] == 3
