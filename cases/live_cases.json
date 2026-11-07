@@ -1,0 +1,179 @@
+{
+  "cases": [
+    {
+      "query": "how much memory does asks for personal specifications or preferences (like laptop",
+      "expect": [
+        7
+      ],
+      "note": "user_pref"
+    },
+    {
+      "query": "which port does wants an LLM review pass (second-pass quality check)",
+      "expect": [
+        69
+      ],
+      "note": "user_pref"
+    },
+    {
+      "query": "what is Knowledge retrieval order for user's wikis: use OpenKnowledge",
+      "expect": [
+        79
+      ],
+      "note": "user_pref"
+    },
+    {
+      "query": "what is Mohamed Elsiddig is a Senior System/DevOps Engineer (6y10m",
+      "expect": [
+        80
+      ],
+      "note": "user_pref"
+    },
+    {
+      "query": "what is Builds on the laptop (shadow-keep) must run inside",
+      "expect": [
+        96
+      ],
+      "note": "user_pref"
+    },
+    {
+      "query": "what is backup script fix: Adding --ignore-failed-read flag to tar",
+      "expect": [
+        15
+      ],
+      "note": "tool"
+    },
+    {
+      "query": "what is Nextcloud file ops: always use MCP nc_webdav_* tools",
+      "expect": [
+        59
+      ],
+      "note": "tool"
+    },
+    {
+      "query": "what is Nextcloud binary uploads (PDF): MCP nc_webdav_write_file with hand-transcribed",
+      "expect": [
+        61
+      ],
+      "note": "tool"
+    },
+    {
+      "query": "what is Himalaya sends (Gmail hermes.agent96@gmail.com): always include explicit `From",
+      "expect": [
+        77
+      ],
+      "note": "tool"
+    },
+    {
+      "query": "tell me about fact 78",
+      "expect": [
+        78
+      ],
+      "note": "tool"
+    },
+    {
+      "query": "which port does Infra report is dynamic: scripts/build-infra-spec.py probes live docker",
+      "expect": [
+        68
+      ],
+      "note": "project"
+    },
+    {
+      "query": "what is LLM wikis: ~/wikis/homelab, ~/wikis/smarthome, ~/wikis/car (Mazda), ~/wikis/hardware (device",
+      "expect": [
+        70
+      ],
+      "note": "project"
+    },
+    {
+      "query": "what is The axis42-web containers on the laptop (shadow-keep) were",
+      "expect": [
+        90
+      ],
+      "note": "project"
+    },
+    {
+      "query": "tell me about fact 94",
+      "expect": [
+        94
+      ],
+      "note": "project"
+    },
+    {
+      "query": "what is The ghcr.io/nesquena/hermes-webui:latest image built 2026-10-23 (digest d0bbb1c5) crash-loops",
+      "expect": [
+        105
+      ],
+      "note": "project"
+    },
+    {
+      "query": "what is ASUS ROG Strix G614JI (shadow-keep, 10.244.0.200, CachyOS/Arch, pacman)",
+      "expect": [
+        2
+      ],
+      "note": "entity"
+    },
+    {
+      "query": "what is Uncle AbdAlazeem's home location is at coordinates 25.022242",
+      "expect": [
+        3
+      ],
+      "note": "entity"
+    },
+    {
+      "query": "what is 's home location: RD 18 Villa No 48",
+      "expect": [
+        5
+      ],
+      "note": "entity"
+    },
+    {
+      "query": "what is 5 (DietPi, 10.244.0.101, hostname DietPi) \u2014 16 GB",
+      "expect": [
+        17
+      ],
+      "note": "entity"
+    },
+    {
+      "query": "what is 2 Model B v1.1 (2015, 10.244.0.100, hostname raspberry-pi2)",
+      "expect": [
+        18
+      ],
+      "note": "entity"
+    },
+    {
+      "query": "tell me about fact 131",
+      "expect": [
+        131
+      ],
+      "note": "general"
+    },
+    {
+      "query": "tell me about fact 137",
+      "expect": [
+        137
+      ],
+      "note": "general"
+    },
+    {
+      "query": "tell me about fact 138",
+      "expect": [
+        138
+      ],
+      "note": "general"
+    },
+    {
+      "query": "what is The rooted Yasmina Yandex Station Mini 2 runs",
+      "expect": [
+        154
+      ],
+      "note": "general"
+    },
+    {
+      "query": "tell me about fact 155",
+      "expect": [
+        155
+      ],
+      "note": "general"
+    }
+  ]
+}
