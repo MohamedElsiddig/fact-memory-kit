@@ -167,7 +167,7 @@ factkit holo expand     --db $DB --text "<query>"          # alias expansion + c
 factkit holo migrate    --db $DB [--verify] [--apply]      # second model, additive
 factkit holo relations  --db $DB [--src N --dst M --rel R --apply]
 factkit holo hops       --db $DB --text "<query>" --depth 2
-factkit holo hrr        --db $DB --smoke <cases.json>      # A/B; exit 1 unless it wins both
+factkit holo hrr        --db $DB --smoke <cases.json>      # A/B; exit 1 unless it wins both (currently loses, do not wire)
 factkit holo rerank     --db $DB --text "<query>" --llm-url https://llm.local/v1 --llm-model <id>
 factkit holo ns         --db $DB [--namespace X --assign-id N] [--text "<query>"]
 ```
@@ -204,8 +204,8 @@ Rules:
   Sundays at 05:00 (`factkit_drill.sh`). Both silent on success.
 * None of `expand`, `hops`, `hrr`, `rerank` or `ns` belong in the per-turn hook.
   `hops` costs extra reads; `rerank` measured ~2.3 s for five hits and must keep
-  returning `no_gain` rather than reordering; `hrr` does not beat lexical on
-  hit@5 yet, so do not wire it.
+  returning `no_gain` rather than reordering; `hrr` lost on live corpus (hit@5
+  0.56 vs 0.76, MRR 0.52 vs 0.77), verdict: do not wire.
 * `holo migrate --apply` is additive (`INSERT OR IGNORE`), resumable, and never
   touches another model's rows. `--rollback` needs the literal confirm token and
   refuses to delete the last model.
