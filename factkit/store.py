@@ -251,6 +251,11 @@ class Store:
         values.append(utcnow())
         values.append(fact_id)
         self.db.execute(f"UPDATE facts SET {', '.join(fields)} WHERE fact_id=?", values)
+        if content is not None and content != before["content"]:
+            removed = self.invalidate_embeddings(fact_id)
+            if removed:
+                self._audit("embedding-invalidate", fact_id, None,
+                            {"models_removed": removed}, actor, reason)
         after = self.get(fact_id)
         self._audit("update", fact_id, before, after, actor, reason)
         self.db.commit()
@@ -319,6 +324,12 @@ class Store:
             "dims=excluded.dims, vec=excluded.vec, created_at=CURRENT_TIMESTAMP",
             (fact_id, model, len(vec), blob),
         )
+
+    def invalidate_embeddings(self, fact_id: int) -> int:
+        """Delete this fact's embeddings for every model (caller commits)."""
+        cur = self.db.execute(
+            "DELETE FROM fact_embeddings WHERE fact_id=?", (fact_id,))
+        return int(cur.rowcount or 0)
 
     def get_embedding(self, fact_id: int, model: str):
         row = self.db.execute(
