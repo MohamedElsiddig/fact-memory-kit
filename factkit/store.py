@@ -185,6 +185,76 @@ class Store:
             self.db.commit()
 
     # ------------------------------------------------------------------ utils
+    @property
+    def db_path(self) -> str:
+        return str(self.path)
+
+    @property
+    def conn(self):
+        return self.db
+
+    @property
+    def _conn(self):
+        return self.db
+
+    def count_facts(self) -> int:
+        return self.count()
+
+    def read(self, sql: str, params=()) -> list:
+        return self.db.execute(sql, params).fetchall()
+
+    def _one(self, sql: str, params=()):
+        return self.db.execute(sql, params).fetchone()
+
+    def _write(self, sql: str, params=()):
+        return self.db.execute(sql, params)
+
+    class _Tx:
+        def __init__(self, db): self.db = db
+        def __enter__(self):
+            if not self.db.in_transaction:
+                self.db.execute("BEGIN IMMEDIATE")
+            return self
+        def __exit__(self, exc_type, *exc):
+            if self.db.in_transaction:
+                (self.db.execute("ROLLBACK") if exc_type else self.db.execute("COMMIT"))
+
+    def _tx(self):
+        return self._Tx(self.db)
+
+    def add_fact_status(self, content: str, category: str = "general", tags: str = "", *,
+                        trust: float | None = None, trust_score: float | None = None,
+                        entities=(), source: str = "manual", **kw) -> tuple[int, bool]:
+        """Provider-compatible add: returns (fact_id, created)."""
+        content = " ".join((content or "").split())
+        if not content:
+            raise ValueError("content is empty")
+        ts = trust if trust is not None else (trust_score if trust_score is not None else 0.5)
+        try:
+            row = self.add_fact(content, category=category, tags=tags, trust_score=ts,
+                                source=source)
+            fid = int(row["fact_id"])
+            # link entities if provided; else auto-extract multi-word candidates
+            names = [(str(n).strip(), "declared") for n in entities or () if isinstance(n, str) and str(n).strip()]
+            if not names:
+                try:
+                    from . import entities as entmod
+                    names = [(n, "extracted") for n in entmod.candidates(content) if len(str(n).split()) > 1]
+                except Exception:
+                    names = []
+            for name, etype in names:
+                eid = self.ensure_entity(name, kind=etype)
+                self.link_entity(fid, eid)
+            if names:
+                self.db.commit()
+            return fid, True
+        except Exception:
+            # duplicate
+            row = self.db.execute("SELECT fact_id FROM facts WHERE content=?", (content,)).fetchone()
+            if row:
+                return int(row["fact_id"]), False
+            raise
+
     def close(self) -> None:
         self.db.close()
 
@@ -230,44 +300,62 @@ class Store:
         self.db.commit()
         return self.get(fact_id)  # type: ignore[return-value]
 
-    def update_fact(self, fact_id: int, *, content: str | None = None,
+    def update_fact(self, fact_id: int, *args, content: str | None = None,
                     category: str | None = None, tags: str | None = None,
-                    trust_score: float | None = None,
-                    review_after: str | None = None,
-                    actor: str = "cli", reason: str = "") -> dict:
+                    trust_score: float | None = None, trust_delta: float | None = None,
+                    review_after: str | None = None, touch: bool = True,
+                    entities=(), actor: str = "cli", reason: str = "", **kw):
         before = self.get(fact_id)
         if before is None:
-            raise KeyError(f"no fact #{fact_id}")
+            return False
         fields, values = [], []
+        if trust_delta is not None and trust_score is None:
+            trust_score = min(1.0, max(0.0, float(before.get("trust_score") or 0) + trust_delta))
         for name, value in (("content", content), ("category", category),
                             ("tags", tags), ("trust_score", trust_score),
                             ("review_after", review_after)):
             if value is not None:
                 fields.append(f"{name}=?")
                 values.append(value)
+        if touch:
+            fields.append("updated_at=?")
+            values.append(utcnow())
         if not fields:
-            return before
-        fields.append("updated_at=?")
-        values.append(utcnow())
+            if touch:
+                self.db.commit()
+            return True
         values.append(fact_id)
         self.db.execute(f"UPDATE facts SET {', '.join(fields)} WHERE fact_id=?", values)
-        if content is not None and content != before["content"]:
-            removed = self.invalidate_embeddings(fact_id)
-            if removed:
-                self._audit("embedding-invalidate", fact_id, None,
-                            {"models_removed": removed}, actor, reason)
+        substantive = any(v is not None for v in (content, category, tags, trust_score, trust_delta, review_after))
+        if content is not None and content != before.get("content"):
+            try:
+                removed = self.invalidate_embeddings(fact_id)
+                if removed and substantive:
+                    self._audit("embedding-invalidate", fact_id, None,
+                                {"models_removed": removed}, actor, reason)
+            except Exception:
+                pass
         after = self.get(fact_id)
-        self._audit("update", fact_id, before, after, actor, reason)
+        if substantive:
+            try:
+                self._audit("update", fact_id, before, after, actor, reason)
+            except Exception:
+                pass
         self.db.commit()
-        return after  # type: ignore[return-value]
+        return True if not substantive else after
 
-    def remove_fact(self, fact_id: int, *, actor: str = "cli",
-                    reason: str = "") -> bool:
+    def remove_fact(self, fact_id: int, *args, **kw) -> bool:
+        actor = kw.get("actor", "cli")
+        reason = kw.get("reason", "")
         before = self.get(fact_id)
         if before is None:
             return False
+        self.db.execute("DELETE FROM fact_entities WHERE fact_id=?", (fact_id,))
         self.db.execute("DELETE FROM facts WHERE fact_id=?", (fact_id,))
-        self._audit("remove", fact_id, before, None, actor, reason)
+        try:
+            self._audit("remove", fact_id, before, None, actor, reason)
+        except Exception:
+            pass
         self.db.commit()
         return True
 

@@ -1,4 +1,5 @@
 embed_base_url: http://127.0.0.1:1234/v1
+# API key: set via FACTKIT_EMBED_API_KEY or agent secret scope (secret)
 embed_api_key: ""
 embed_model: text-embedding-nomic-embed-text-v1.5
 prefetch: true

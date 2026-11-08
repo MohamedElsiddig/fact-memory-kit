@@ -5,11 +5,12 @@ from types import SimpleNamespace
 import pytest
 
 from factkit import holo, prose
+from factkit.store import Store
 
 
 # ------------------------------------------------------------------ helpers
 def make_store(tmp_path, contents, *, name="m.db", entities=()):
-    store = holo.load_plugin_store(str(tmp_path / name))
+    store = Store(tmp_path / name)
     ids = []
     for content in contents:
         fid, _ = store.add_fact_status(content, category="tool", tags="", trust=0.7,
@@ -282,7 +283,7 @@ def test_compatible_pairs_are_not_proposed(tmp_path):
 
 
 def test_empty_store(tmp_path):
-    store = holo.load_plugin_store(str(tmp_path / "empty.db"))
+    store = Store(tmp_path / "empty.db")
 
     assert prose.candidate_pairs(store) == []
     assert prose.prose_scan(store, FakeClient([])) == {

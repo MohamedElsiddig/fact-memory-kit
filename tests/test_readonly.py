@@ -4,12 +4,15 @@ import sqlite3
 import pytest
 
 from factkit import holo
+from factkit.store import Store
 
 
 def _db(tmp_path):
-    store = holo.load_plugin_store(str(tmp_path / "ro.db"))
+    path = tmp_path / "ro.db"
+    store = Store(path)
     store.add_fact_status("Atlas Server has 16 GB RAM", category="entity", tags="", trust=0.9, entities=[])
-    return store.db_path
+    store.close()
+    return str(path)
 
 
 def test_reads_facts(tmp_path):

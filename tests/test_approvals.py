@@ -3,6 +3,7 @@ import hashlib
 import json
 
 from factkit import approvals, holo, maintenance, policy
+from factkit.store import Store
 
 # ------------------------------------------------------------------ fixtures
 def _conflict_store(tmp_path, name="conflict.db"):
@@ -11,7 +12,7 @@ def _conflict_store(tmp_path, name="conflict.db"):
     The newer row (higher id, newer port) is the keep side, matching how the
     conflict scan nominates a pair.
     """
-    store = holo.load_plugin_store(str(tmp_path / name))
+    store = Store(tmp_path / name)
     store.add_fact_status("Test Node alpha listens on port 7000", category="tool",
                           tags="", trust=0.7, entities=["Test Node alpha"])
     store.add_fact_status("Test Node alpha listens on port 7001", category="tool",
@@ -20,7 +21,7 @@ def _conflict_store(tmp_path, name="conflict.db"):
 
 
 def _two_conflict_store(tmp_path):
-    store = holo.load_plugin_store(str(tmp_path / "two.db"))
+    store = Store(tmp_path / "two.db")
     for text, trust in (
         ("Test Node alpha listens on port 7001", 0.8),
         ("Test Node alpha listens on port 7000", 0.7),
@@ -33,7 +34,7 @@ def _two_conflict_store(tmp_path):
 
 
 def _duplicate_store(tmp_path):
-    store = holo.load_plugin_store(str(tmp_path / "dupe.db"))
+    store = Store(tmp_path / "dupe.db")
     store.add_fact_status("Backup drive alpha holds nightly snapshots", category="tool",
                           tags="", trust=0.6)
     store.add_fact_status("Backup drive alpha holds nightly snapshot", category="tool",
@@ -64,8 +65,13 @@ def _insert(store, proposal_id, *, keep, retire, slots="port", ratio=0.5,
 
 
 def _audit(store, action):
-    return [dict(row) for row in store.read(
-        "SELECT action, fact_id, actor, reason FROM audit WHERE action = ? ORDER BY id", (action,))]
+    try:
+        rows = store.read(
+            "SELECT action, fact_id, actor, reason FROM audit WHERE action = ? ORDER BY audit_id", (action,))
+    except Exception:
+        rows = store.read(
+            "SELECT action, fact_id, actor, reason FROM audit WHERE action = ? ORDER BY rowid", (action,))
+    return [dict(row) for row in rows]
 
 
 # --------------------------------------------------------------------- reads
@@ -90,7 +96,7 @@ def test_pending_lists_codes_and_fields(tmp_path):
 
 
 def test_pending_truncates_text_to_100(tmp_path):
-    store = holo.load_plugin_store(str(tmp_path / "long.db"))
+    store = Store(tmp_path / "long.db")
     _insert(store, 1, keep=10, retire=11, keep_text="k" * 180, retire_text="r" * 180)
 
     row = approvals.pending(store)[0]
@@ -131,7 +137,7 @@ def test_unknown_code_resolves_to_none(tmp_path):
 
 
 def test_empty_store_is_total(tmp_path):
-    store = holo.load_plugin_store(str(tmp_path / "empty.db"))
+    store = Store(tmp_path / "empty.db")
 
     assert approvals.pending(store) == []
     assert approvals.history(store) == []
@@ -141,7 +147,7 @@ def test_empty_store_is_total(tmp_path):
 
 
 def test_ambiguous_duplicate_code_is_handled(tmp_path):
-    store = holo.load_plugin_store(str(tmp_path / "amb.db"))
+    store = Store(tmp_path / "amb.db")
     seen, pair = {}, []
     for candidate in range(1, 20000):
         prefix = hashlib.sha1(str(candidate).encode()).hexdigest()[:4]
@@ -325,7 +331,7 @@ def test_history_keeps_legacy_applied_proposals(tmp_path):
 
 # -------------------------------------------------------------------- render
 def test_render_ten_proposals_stays_under_15_lines(tmp_path):
-    store = holo.load_plugin_store(str(tmp_path / "render.db"))
+    store = Store(tmp_path / "render.db")
     for proposal_id in range(1, 11):
         _insert(store, proposal_id, keep=100 + proposal_id, retire=200 + proposal_id,
                 keep_text=f"keep text {proposal_id}", retire_text=f"retire text {proposal_id}")
@@ -343,7 +349,7 @@ def test_render_ten_proposals_stays_under_15_lines(tmp_path):
 
 
 def test_render_limits_a_long_listing(tmp_path):
-    store = holo.load_plugin_store(str(tmp_path / "many.db"))
+    store = Store(tmp_path / "many.db")
     for proposal_id in range(1, 21):
         _insert(store, proposal_id, keep=100 + proposal_id, retire=200 + proposal_id)
 

@@ -68,7 +68,7 @@ sha256() {
 # they may legitimately appear next to an installed copy and are not drift
 is_dist_owned() {
   case "$1" in
-    update.yaml|README.md|LICENSE|config.yaml.example|config.example.yaml|config.yaml|*.pyc|__pycache__)
+    update.yaml|README.md|LICENSE|config.yaml.example|config.example.yaml|config.yaml|facts.db|facts.db-shm|facts.db-wal|*.pyc|__pycache__)
       return 0 ;;
   esac
   return 1

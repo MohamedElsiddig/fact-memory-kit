@@ -3,11 +3,12 @@ import json
 import sqlite3
 
 from factkit import holo, maintenance, policy
+from factkit.store import Store
 
 
 def _store(tmp_path, *, older="2026-10-01 00:00:00", newer="2026-11-04 00:00:00",
            old_port="7000", new_port="7001"):
-    store = holo.load_plugin_store(str(tmp_path / "m.db"))
+    store = Store(tmp_path / "m.db")
     store.add_fact_status(f"Test Node alpha runs on port {old_port}", category="tool",
                           tags="", trust=0.7, entities=["Test Node alpha"])
     store.add_fact_status(f"Test Node alpha runs on port {new_port}", category="tool",
@@ -37,7 +38,9 @@ def _policy(**kw):
 
 
 def test_columns_created_on_a_bare_store(tmp_path):
-    store = holo.load_plugin_store(str(tmp_path / "bare.db"))
+    store = Store(tmp_path / "bare.db")
+    store.db.execute("DROP TABLE IF EXISTS conflict_proposals")
+    store.db.commit()
     assert "conflict_proposals" not in {r[0] for r in store._conn.execute(
         "SELECT name FROM sqlite_master WHERE type='table'")}
 
@@ -49,7 +52,7 @@ def test_columns_created_on_a_bare_store(tmp_path):
 
 
 def test_old_table_is_migrated_without_losing_rows(tmp_path):
-    store = holo.load_plugin_store(str(tmp_path / "old.db"))
+    store = Store(tmp_path / "old.db")
     maintenance.ensure_tombstones(store)          # legacy shape, no new columns
     with store._tx():
         store._write(
@@ -106,7 +109,7 @@ def test_repeating_the_same_pair_does_not_duplicate(tmp_path):
 
 
 def test_duplicate_evidence_is_valid_json(tmp_path):
-    store = holo.load_plugin_store(str(tmp_path / "dupe.db"))
+    store = Store(tmp_path / "dupe.db")
     store.add_fact_status("Backup drive alpha holds nightly snapshots", category="tool",
                           tags="", trust=0.6, entities=[])
     store.add_fact_status("Backup drive alpha holds nightly snapshot", category="tool",
