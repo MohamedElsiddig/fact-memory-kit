@@ -81,6 +81,7 @@ def _manifest_source(repo: Path, rel: str) -> Path | None:
 # files owned by the plugin's own update channel rather than by this manifest:
 # they may legitimately sit next to an installed copy and are not drift
 _DIST_OWNED = {
+    "facts.db", "facts.db-shm", "facts.db-wal",
     "update.yaml", "README.md", "LICENSE", "config.yaml.example",
     "config.example.yaml", "config.yaml",
 }

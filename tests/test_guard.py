@@ -2,6 +2,7 @@
 import pytest
 
 from factkit import guard, holo
+from factkit.store import Store
 
 ATLAS = "Atlas Server"
 
@@ -10,7 +11,7 @@ def _store(path, facts=()):
     """A tmp store populated through the plugin's own write API."""
     if path.is_dir():
         path = path / "guard.db"
-    store = holo.load_plugin_store(str(path))
+    store = Store(path)
     for fact in facts:
         if isinstance(fact, str):
             fact = {"content": fact}

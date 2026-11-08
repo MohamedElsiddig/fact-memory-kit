@@ -7,6 +7,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from factkit import decay, holo
+from factkit.store import Store
 
 NOW = datetime(2026, 11, 6, 12, 0, tzinfo=timezone.utc)
 
@@ -30,7 +31,7 @@ def _fact(**over) -> dict:
 
 def _store(tmp_path, specs):
     """A throwaway plugin store whose rows carry explicit ages."""
-    store = holo.load_plugin_store(str(tmp_path / "decay.db"))
+    store = Store(tmp_path / "decay.db")
     ids = []
     for spec in specs:
         fact_id, _ = store.add_fact_status(
@@ -46,6 +47,11 @@ def _store(tmp_path, specs):
         con.commit()
     finally:
         con.close()
+    try:
+        store.db.execute("DELETE FROM audit")
+        store.db.commit()
+    except Exception:
+        pass
     return store, ids
 
 
@@ -220,7 +226,7 @@ def test_scan_is_read_only(tmp_path):
 
 
 def test_scan_empty_store(tmp_path):
-    store = holo.load_plugin_store(str(tmp_path / "empty.db"))
+    store = Store(tmp_path / "empty.db")
     assert decay.scan(store, now=NOW) == {
         "scanned": 0,
         "counts": {"fresh": 0, "aging": 0, "stale": 0, "expired": 0},

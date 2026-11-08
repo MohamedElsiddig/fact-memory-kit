@@ -109,8 +109,8 @@ class _MiniStore:
 
 def _make_store(path):
     try:
-        from factkit import holo
-        return holo.load_plugin_store(path)
+        from factkit.store import Store
+        return Store(path)
     except Exception:  # noqa: BLE001 - plugin not installed in this environment
         return _MiniStore(path)
 
@@ -247,9 +247,15 @@ def test_restore_relinks_declared_entities(store):
     maintenance.tombstone_fact(store, fid)
     _remove(store, fid)
     new_id = maintenance.restore_fact(store, fid)["fact_id"]
-    linked = {row["name"] for row in store.read(
-        "SELECT e.name FROM fact_entities fe JOIN entities e ON e.entity_id = fe.entity_id "
-        "WHERE fe.fact_id = ? AND e.entity_type = 'declared'", (new_id,))}
+    try:
+        rows = store.read(
+            "SELECT e.name FROM fact_entities fe JOIN entities e ON e.entity_id = fe.entity_id "
+            "WHERE fe.fact_id = ? AND e.entity_type = 'declared'", (new_id,))
+    except Exception:
+        rows = store.read(
+            "SELECT e.name FROM fact_entities fe JOIN entities e ON e.entity_id = fe.entity_id "
+            "WHERE fe.fact_id = ? AND e.kind = 'declared'", (new_id,))
+    linked = {row["name"] for row in rows}
     assert "Atlas Server" in linked
 
 

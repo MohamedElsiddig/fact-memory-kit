@@ -4,11 +4,12 @@ import sqlite3
 import pytest
 
 from factkit import holo, maintenance, policy, smoke
+from factkit.store import Store
 
 
 def _store(tmp_path, *, older="2026-10-01 00:00:00", newer="2026-11-04 00:00:00",
            old_port="7000", new_port="7001", n_extra=0):
-    store = holo.load_plugin_store(str(tmp_path / "m.db"))
+    store = Store(tmp_path / "m.db")
     store.add_fact_status(f"Test Node alpha runs on port {old_port}", category="tool",
                           tags="", trust=0.7, entities=["Test Node alpha"])
     store.add_fact_status(f"Test Node alpha runs on port {new_port}", category="tool",
