@@ -876,6 +876,9 @@ def cmd_sync(args) -> int:
 
 def cmd_holo(args) -> int:
     store = holo.load_plugin_store(args.db)
+    if store is None:
+        print("error: store not found; factkit does not create it", file=sys.stderr)
+        return 2
     action = args.action
     if action == "conflicts":
         pairs = holo.find_conflicts(args.db)
@@ -1121,6 +1124,9 @@ def cmd_holo(args) -> int:
 def cmd_prefetch(args) -> int:
     """What the pre_llm_call hook would inject for a message."""
     store = holo.load_plugin_store(args.db)
+    if store is None:
+        print("error: store not found; factkit does not create it", file=sys.stderr)
+        return 2
     print(json.dumps(holo.prefetch(store, args.message, limit=args.limit), indent=2))
     return 0
 

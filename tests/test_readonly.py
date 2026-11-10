@@ -40,3 +40,10 @@ def test_missing_file_is_not_created(tmp_path):
     with pytest.raises((sqlite3.OperationalError, FileNotFoundError)):
         holo.ReadOnlyStore(target)
     assert not target.exists()
+
+
+def test_load_plugin_store_missing_returns_none_and_creates_nothing(tmp_path):
+    target = tmp_path / "absent" / "memory_store.db"
+    assert holo.load_plugin_store(target) is None
+    assert not target.exists()
+    assert not target.parent.exists()
