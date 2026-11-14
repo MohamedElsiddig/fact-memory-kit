@@ -370,3 +370,82 @@ def test_render_shows_ids_and_reason():
     assert "ab12" in text
     assert "keep #5" in text and "retire #3" in text
     assert "duplicate 97% similar" in text
+
+
+# ------------------------------------------------------------------ batch UX
+def test_pending_is_oldest_first(tmp_path):
+    store = Store(tmp_path / "order.db")
+    _insert(store, 7, keep=107, retire=207)
+    _insert(store, 2, keep=102, retire=202)
+    _insert(store, 5, keep=105, retire=205)
+
+    assert [row["proposal_id"] for row in approvals.pending(store)] == [2, 5, 7]
+
+
+def test_pending_kind_filter_keeps_codes_stable(tmp_path):
+    store = Store(tmp_path / "kinds.db")
+    _insert(store, 1, keep=101, retire=201, slots="port")
+    _insert(store, 2, keep=102, retire=202, slots="duplicate")
+
+    all_rows = {row["proposal_id"]: row for row in approvals.pending(store)}
+    conflicts = approvals.pending(store, kind="conflict")
+    duplicates = approvals.pending(store, kind="duplicate")
+
+    assert [row["proposal_id"] for row in conflicts] == [1]
+    assert [row["proposal_id"] for row in duplicates] == [2]
+    assert conflicts[0]["code"] == all_rows[1]["code"]
+    assert duplicates[0]["code"] == all_rows[2]["code"]
+
+
+def test_pending_evidence_includes_source(tmp_path):
+    store = Store(tmp_path / "src.db")
+    store.add_fact_status("Test Node alpha listens on port 7000", category="tool", tags="",
+                          trust=0.7, entities=["Test Node alpha"], source="provider")
+    store.add_fact_status("Test Node alpha listens on port 7001", category="tool", tags="",
+                          trust=0.8, entities=["Test Node alpha"], source="import")
+    _propose(store)
+
+    row = approvals.pending(store)[0]
+
+    assert row["keep_source"] == "import"
+    assert row["retire_source"] == "provider"
+    assert row["source"] == "import/provider"
+
+
+def test_pending_kind_filter_respects_limit(tmp_path):
+    store = Store(tmp_path / "kindlimit.db")
+    for proposal_id in range(1, 5):
+        _insert(store, proposal_id, keep=100 + proposal_id, retire=200 + proposal_id)
+
+    assert len(approvals.pending(store, kind="conflict", limit=2)) == 2
+
+
+def test_render_shows_texts_source_and_truncates():
+    text = approvals.render([{
+        "code": "ab12", "proposal_id": 7, "kind": "duplicate", "keep_id": 5,
+        "retire_id": 3, "ratio": 0.97, "source": "provider/import",
+        "keep_text": "k" * 180, "retire_text": "r" * 180,
+    }])
+
+    line = text.splitlines()[1]
+    assert "ab12" in line
+    assert "keep #5" in line and "retire #3" in line
+    assert "duplicate 97% similar" in line
+    assert "src=provider/import" in line
+    keep_seg = line.split('keep: "', 1)[1].split('"', 1)[0]
+    retire_seg = line.split('retire: "', 1)[1].split('"', 1)[0]
+    assert keep_seg == "k" * approvals.TEXT_LIMIT
+    assert retire_seg == "r" * approvals.TEXT_LIMIT
+
+
+def test_render_flattens_newlines_in_texts():
+    text = approvals.render([{
+        "code": "ab12", "proposal_id": 7, "kind": "conflict", "keep_id": 5,
+        "retire_id": 3, "ratio": 0.5,
+        "keep_text": "first\nsecond", "retire_text": "third\r\nfourth",
+    }])
+
+    lines = text.splitlines()
+    assert len(lines) == 4                      # header + one row + two footers
+    assert "first second" in lines[1]
+    assert "third fourth" in lines[1]

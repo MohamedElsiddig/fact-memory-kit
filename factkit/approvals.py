@@ -164,11 +164,36 @@ def _fact_texts(store, rows) -> dict[int, str]:
         return {}
 
 
-def _project(row: dict, texts: dict[int, str], code: str = "") -> dict:
+def _fact_sources(store, rows) -> dict[int, str]:
+    """``source`` per fact id, or {} when the store has no such column."""
+    ids = sorted({int(row["keep_id"]) for row in rows} | {int(row["retire_id"]) for row in rows})
+    if not ids or "source" not in _columns(store, "facts"):
+        return {}
+    marks = ",".join("?" for _ in ids)
+    try:
+        return {int(row["fact_id"]): str(row["source"] or "")
+                for row in _rows(store, f"SELECT fact_id, source FROM facts WHERE fact_id IN ({marks})", ids)}
+    except Exception:  # noqa: BLE001 - a missing facts table just means no source
+        return {}
+
+
+def _source_label(keep: str, retire: str) -> str:
+    """One compact source label; both sides when they differ."""
+    if keep and retire and keep != retire:
+        return f"{keep}/{retire}"
+    return keep or retire
+
+
+def _project(row: dict, texts: dict[int, str], code: str = "",
+             sources: dict[int, str] | None = None) -> dict:
     evidence = _evidence(row)
     keep_id, retire_id = int(row["keep_id"]), int(row["retire_id"])
+    sources = sources or {}
+    shared_source = str(evidence.get("source") or "")
     keep_text = str(evidence.get("keep_text") or texts.get(keep_id) or "")
     retire_text = str(evidence.get("retire_text") or texts.get(retire_id) or "")
+    keep_source = str(sources.get(keep_id) or evidence.get("keep_source") or shared_source)
+    retire_source = str(sources.get(retire_id) or evidence.get("retire_source") or shared_source)
     try:
         ratio = float(row.get("jaccard") or 0.0)
     except (TypeError, ValueError):
@@ -182,6 +207,9 @@ def _project(row: dict, texts: dict[int, str], code: str = "") -> dict:
         "keep_text": keep_text[:TEXT_LIMIT],
         "retire_text": retire_text[:TEXT_LIMIT],
         "ratio": round(ratio, 3),
+        "source": _source_label(keep_source, retire_source),
+        "keep_source": keep_source,
+        "retire_source": retire_source,
         "created_at": row.get("created_at"),
         "batch_id": row.get("batch_id"),
     }
@@ -208,14 +236,23 @@ def _limit(value, default: int) -> int:
 
 
 # --------------------------------------------------------------------- reads
-def pending(store, *, limit=10) -> list[dict]:
-    """Pending proposals, oldest first, each with the code the user types."""
+def pending(store, *, limit=10, kind=None) -> list[dict]:
+    """Pending proposals, oldest first, each with the code the user types.
+
+    ``kind`` filters by ``conflict``/``duplicate`` after the codes are derived,
+    so filtering never changes a code that the unfiltered listing showed.
+    """
     rows = _fetch(store, "status = 'pending'")
     if not rows:
         return []
     texts = _fact_texts(store, rows)
+    sources = _fact_sources(store, rows)
     codes = _codes([row["id"] for row in rows])
-    return [_project(row, texts, code) for row, code in zip(rows, codes)][:_limit(limit, 10)]
+    items = [_project(row, texts, code, sources) for row, code in zip(rows, codes)]
+    wanted = str(kind or "").strip().lower()
+    if wanted:
+        items = [item for item in items if item["kind"] == wanted]
+    return items[:_limit(limit, 10)]
 
 
 def resolve_code(store, code) -> dict | None:
@@ -225,7 +262,8 @@ def resolve_code(store, code) -> dict | None:
     if match is None:
         return None
     codes = dict(zip([row["id"] for row in rows], _codes([row["id"] for row in rows])))
-    return _project(match, _fact_texts(store, rows), codes[match["id"]])
+    return _project(match, _fact_texts(store, rows), codes[match["id"]],
+                    _fact_sources(store, rows))
 
 
 def render(list_or_rows) -> str:
@@ -262,7 +300,17 @@ def render(list_or_rows) -> str:
             reason = f"duplicate {ratio:.0%} similar" if ratio else "duplicate"
         else:
             reason = f"conflict {ratio:.0%} overlap" if ratio else "conflict"
-        lines.append(f"{code}  keep #{keep} / retire #{retire}  {reason}")
+        line = f"{code}  keep #{keep} / retire #{retire}  {reason}"
+        source = str(item.get("source") or "").strip()
+        if source:
+            line += f"  src={source}"
+        keep_text = " ".join(str(item.get("keep_text") or "").split())[:TEXT_LIMIT]
+        if keep_text:
+            line += f'  keep: "{keep_text}"'
+        retire_text = " ".join(str(item.get("retire_text") or "").split())[:TEXT_LIMIT]
+        if retire_text:
+            line += f'  retire: "{retire_text}"'
+        lines.append(line)
 
     lines.append("Reply: approve <code> or reject <code>")
     if total > len(shown):
