@@ -63,6 +63,10 @@ def _propose(store):
     (["holo", "migrate"], False),
     (["holo", "migrate", "--apply"], True),
     (["holo", "migrate", "--rollback"], True),
+    (["holo", "cache"], False),
+    (["holo", "cache", "--prune"], False),
+    (["holo", "index"], False),
+    (["holo", "index", "--apply"], True),
 ])
 def test_holo_needs_write(argv, expected):
     args = cli.build_parser().parse_args(argv)

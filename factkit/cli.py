@@ -33,6 +33,10 @@ def _print_json(payload) -> None:
     print(json.dumps(payload, indent=1, ensure_ascii=False, default=str))
 
 
+# One JSON line per `holo metrics` run when --save is given without a path.
+METRICS_HISTORY_PATH = str(Path.home() / ".hermes" / "factkit-metrics.jsonl")
+
+
 def _sha256(path: Path) -> str | None:
     try:
         return hashlib.sha256(path.read_bytes()).hexdigest()
@@ -785,12 +789,15 @@ def build_parser() -> argparse.ArgumentParser:
                                       "undo", "tombstones", "purge", "guard",
                                       "decay", "provenance", "prose", "metrics",
                                       "limits", "approve", "asof", "expand", "migrate",
-                                      "relations", "hops", "hrr", "rerank", "ns"])
+                                      "relations", "hops", "hrr", "rerank", "ns",
+                                      "cache", "index"])
     p.add_argument("--db", default=str(Path.home() / ".hermes" / "memory_store.db"))
     p.add_argument("--apply", action="store_true", help="write changes (default: report only)")
     p.add_argument("--days", type=int, default=90)
     p.add_argument("--slot-days", type=int, default=180)
     p.add_argument("--threshold", type=float, default=0.92)
+    p.add_argument("--prune", action="store_true",
+                   help="'cache': enforce the TTL and size cap, report removed rows")
     p.add_argument("--touch", type=int, metavar="FACT_ID", help="mark a reviewed fact as still true")
     p.add_argument("--adjudicate", action="store_true",
                    help="ask the local LLM to judge prose contradictions (proposals only)")
@@ -801,6 +808,14 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--limit", type=int, default=None, help="cap applied changes in this run")
     p.add_argument("--smoke", metavar="JSON", default=None,
                    help="smoke cases file; a regression reverts the batch")
+    p.add_argument("--report", action="store_true",
+                   help="'metrics': always exit 0; a failed gate is reported, not fatal")
+    p.add_argument("--save", nargs="?", const=METRICS_HISTORY_PATH, default=None,
+                   metavar="PATH",
+                   help="'metrics': append one JSON row to PATH "
+                        f"(default: {METRICS_HISTORY_PATH})")
+    p.add_argument("--min-score", dest="min_score", type=float, default=None,
+                   help="'metrics': cosine floor for the vector channel only")
     p.add_argument("--fact-id", type=int, default=None, help="fact id for undo")
     p.add_argument("--code", default=None, help="proposal code for 'approve'")
     p.add_argument("--model", default=None, help="target embedding model for 'migrate'")
@@ -902,10 +917,43 @@ def _holo_needs_write(args) -> bool:
         return bool(apply and args.assign_id and args.namespace)
     if action == "approve":
         return bool(args.code)
+    if action == "cache":
+        return False
+    if action == "index":
+        return apply
     return False
 
 
 def cmd_holo(args) -> int:
+    action = args.action
+    if action == "cache":
+        # No store needed: cache stats must work with no database at all, and
+        # --prune on a missing cache file must not create one.
+        _print_json(holo.prune_embed_cache() if args.prune
+                    else holo.embed_cache_stats())
+        return 0
+    if action == "index":
+        # Read through the read-only handle; --apply writes vectors only, into
+        # factkit's own DB, so a missing store is refused instead of created.
+        store = holo.load_plugin_store(args.db)
+        if store is None:
+            print("error: store not found; factkit does not create it", file=sys.stderr)
+            return 2
+        if not args.apply:
+            _print_json({"db": args.db, **holo.embedding_coverage(store)})
+            return 0
+        result = holo.index_pending(
+            store, timeout=args.timeout if args.timeout is not None else 30.0)
+        payload = {"db": args.db, "model": result.get("model"),
+                   "embedded": result.get("indexed", 0),
+                   "failed": result.get("failed", 0),
+                   "skipped": result.get("skipped", 0),
+                   "pending": result.get("pending", 0),
+                   "timed_out": bool(result.get("timed_out", False))}
+        if result.get("error"):
+            payload["error"] = result["error"]
+        _print_json(payload)
+        return 1 if result.get("error") else 0
     if _holo_needs_write(args):
         store = holo.get_memory_store(args.db)
     else:
@@ -913,7 +961,6 @@ def cmd_holo(args) -> int:
         if store is None:
             print("error: store not found; factkit does not create it", file=sys.stderr)
             return 2
-    action = args.action
     if action == "conflicts":
         pairs = holo.find_conflicts(args.db)
         if args.adjudicate and pairs:
@@ -1014,10 +1061,18 @@ def cmd_holo(args) -> int:
         embedder = None
         if cases:
             embedder = from_config(Config.load(args.db))
-        result = live_metrics.evaluate(store, cases, k=args.limit or 5, embedder=embedder)
+        result = live_metrics.evaluate(store, cases, k=args.limit or 5,
+                                       embedder=embedder, min_score=args.min_score)
         verdict = live_metrics.gate(result)
         _print_json({"db": args.db, "cases": path, **result, "gate": verdict})
-        return 0 if verdict["ok"] else 1
+        if args.save:
+            try:
+                saved = live_metrics.append_history(args.save, result, verdict)
+            except OSError as exc:
+                print(f"error: could not save metrics: {exc}", file=sys.stderr)
+                return 2
+            print(f"saved metrics to {saved}", file=sys.stderr)
+        return 0 if args.report or verdict["ok"] else 1
     if action == "expand":
         from . import expand as ex
         if not args.text:
