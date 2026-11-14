@@ -821,6 +821,10 @@ def build_parser() -> argparse.ArgumentParser:
                    help="point in time for 'asof' queries")
     p.add_argument("--text", default=None, metavar="FACT",
                    help="candidate fact text for 'guard' (checks before writing)")
+    p.add_argument("--json", action="store_true",
+                   help="machine-readable output for 'guard' and 'approve'")
+    p.add_argument("--kind", choices=("conflict", "duplicate"), default=None,
+                   help="filter 'approve' listings by proposal kind")
     p.add_argument("--max-ratio", type=float, default=0.20,
                    help="abort when candidates exceed this fraction of the store")
     p.set_defaults(func=cmd_holo)
@@ -874,11 +878,41 @@ def cmd_sync(args) -> int:
     return 0
 
 
+def _holo_needs_write(args) -> bool:
+    """True when this holo invocation can write, so it needs a writable store.
+
+    Report-only invocations stay on the read-only handle, which never creates a
+    store. A write flag that does not match its action (for example ``--apply``
+    on ``decay``) does not make the action writable.
+    """
+    action = args.action
+    apply = bool(getattr(args, "apply", False))
+    if action == "purge":
+        return True
+    if action in ("conflicts", "dupes", "maintain", "undo", "provenance",
+                  "prose", "limits"):
+        return apply
+    if action == "stale":
+        return bool(args.touch) and apply
+    if action == "migrate":
+        return bool(apply or args.rollback)
+    if action == "relations":
+        return bool(apply and args.src and args.dst and args.rel)
+    if action == "ns":
+        return bool(apply and args.assign_id and args.namespace)
+    if action == "approve":
+        return bool(args.code)
+    return False
+
+
 def cmd_holo(args) -> int:
-    store = holo.load_plugin_store(args.db)
-    if store is None:
-        print("error: store not found; factkit does not create it", file=sys.stderr)
-        return 2
+    if _holo_needs_write(args):
+        store = holo.get_memory_store(args.db)
+    else:
+        store = holo.load_plugin_store(args.db)
+        if store is None:
+            print("error: store not found; factkit does not create it", file=sys.stderr)
+            return 2
     action = args.action
     if action == "conflicts":
         pairs = holo.find_conflicts(args.db)
@@ -1089,9 +1123,13 @@ def cmd_holo(args) -> int:
     if action == "approve":
         from . import approvals
         if not args.code:
-            rows = approvals.pending(store, limit=args.limit or 10)
-            _print_json({"db": args.db, "pending": len(rows), "rows": rows,
-                         "text": approvals.render(rows)})
+            rows = approvals.pending(store, limit=args.limit or 10,
+                                     kind=getattr(args, "kind", None))
+            if getattr(args, "json", False):
+                _print_json({"db": args.db, "pending": len(rows),
+                             "kind": getattr(args, "kind", None), "rows": rows})
+            else:
+                print(approvals.render(rows))
             return 0
         result = approvals.decide(store, args.code,
                                   action="reject" if args.reject else "accept",
@@ -1111,11 +1149,21 @@ def cmd_holo(args) -> int:
     if action == "guard":
         from . import guard
         if not args.text:
-            _print_json({"error": "--text is required for guard", "verdict": "error"})
+            if getattr(args, "json", False):
+                _print_json({"verdict": "error", "matches": [], "suggestion": None,
+                             "human": "", "error": "--text is required for guard"})
+            else:
+                print("error: --text is required for guard", file=sys.stderr)
             return 2
         result = guard.check(store, args.text)
-        _print_json({"db": args.db, "text": args.text, **result,
-                     "human": guard.format_report(result)})
+        human = guard.format_report(result)
+        if getattr(args, "json", False):
+            _print_json({"verdict": result.get("verdict"),
+                         "matches": result.get("matches") or [],
+                         "suggestion": result.get("suggestion"),
+                         "human": human})
+        else:
+            print(human)
         # exit 1 so a shell or hook can treat a blocked insert as failure
         return 0 if result.get("verdict") == "ok" else 1
     raise SystemExit(f"unknown action {action}")

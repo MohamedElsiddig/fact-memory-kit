@@ -191,30 +191,46 @@ an `audit` row with actor `factkit`.
 
 ## Companion operations
 
-### Pre-insert guard
+### Check before you write
 
-Check a fact against the store before writing it. Read-only, and it exits 1
-whenever the insert should be blocked, so a script can branch on it:
+Run the guard against the store before inserting a fact. It only reads, and it
+exits 1 whenever the insert should be blocked, so a script can branch on it:
 
 ```bash
+# human-readable verdict (default)
 factkit holo guard --db $DB --text "Raspberry Pi 2 has 4 GB RAM"
-# {"verdict": "conflict", "matches": [...], "suggestion": "...", "human": "..."}
+
+# machine-readable: {verdict, matches, suggestion, human}
+factkit holo guard --db $DB --text "Raspberry Pi 2 has 4 GB RAM" --json
+
+# gate a write in a shell
+if factkit holo guard --db $DB --text "$FACT" >/dev/null; then
+    factkit add "$FACT"
+fi
 ```
 
 `duplicate` (>= 0.98 with identical numeric tokens), `conflict` (same named
 attribute, different value, unit-normalised), `near` (0.90-0.97, merge the
-wording). The guard only sees attributes the text names: "has 16 GB" without
-the word RAM is reported `ok`, which is the intended conservative failure.
+wording). The guard is advisory: exit 1 means "do not insert this", but it
+never writes or blocks a store operation by itself. It only sees attributes
+the text names: "has 16 GB" without the word RAM is reported `ok`, which is the
+intended conservative failure.
 
 ### Chat approval
 
 Proposals live in `conflict_proposals`; the chat path is a short code per row:
 
 ```bash
-factkit holo approve --db $DB                          # list pending + rendered text
+factkit holo approve --db $DB                          # list pending (rendered, oldest first)
+factkit holo approve --db $DB --kind conflict --json   # same rows as JSON
 factkit holo approve --db $DB --code 1a2b --apply      # accept (tombstone path)
 factkit holo approve --db $DB --code 1a2b --reject     # status only
 ```
+
+Each rendered row carries the proposal code, both fact ids and texts (truncated
+to 100 characters), the reason/ratio and the facts' source when the store
+records one. `--limit` caps a listing; `--kind` filters it without changing the
+codes.
 
 Accept delegates to `apply_conflict`/`apply_merge` with a fresh `chat-<ts>`
 batch, so the tombstone and undo path is unchanged. A second accept returns
