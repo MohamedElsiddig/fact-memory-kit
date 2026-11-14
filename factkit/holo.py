@@ -448,17 +448,19 @@ CREATE INDEX IF NOT EXISTS idx_factkit_emb_model ON fact_embeddings(model);
 """
 
 
-def _factkit_vectors_db_path() -> Path:
+def _factkit_vectors_db_path(*, create: bool = True) -> Path:
+    """Where factkit's vectors live; ``create=False`` never touches the disk."""
     try:
         from plugins import plugin_storage  # type: ignore
-        try:
-            conn = plugin_storage.plugin_db("factkit")
-            dbp = Path(conn.execute("PRAGMA database_list").fetchone()[2])
-            conn.close()
-            if dbp and str(dbp) != ":memory:":
-                return dbp
-        except Exception:
-            pass
+        if create:
+            try:
+                conn = plugin_storage.plugin_db("factkit")
+                dbp = Path(conn.execute("PRAGMA database_list").fetchone()[2])
+                conn.close()
+                if dbp and str(dbp) != ":memory:":
+                    return dbp
+            except Exception:
+                pass
         try:
             return plugin_storage.plugin_data_dir("factkit") / "facts.db"
         except Exception:
@@ -466,12 +468,26 @@ def _factkit_vectors_db_path() -> Path:
     except Exception:
         pass
     base = _hermes_home() / "plugins" / "factkit"
-    base.mkdir(parents=True, exist_ok=True)
+    if create:
+        base.mkdir(parents=True, exist_ok=True)
     return base / "facts.db"
 
 
-def _factkit_vectors_conn(readonly: bool = False):
-    dbp = _factkit_vectors_db_path()
+def _factkit_vectors_conn(readonly: bool = False, create: bool = True):
+    dbp = _factkit_vectors_db_path() if create else _factkit_vectors_db_path(create=False)
+    if not create:
+        # A read-only diagnostic must not create the vectors DB; no file means
+        # no vectors, which is exactly what the caller should report.
+        if not Path(dbp).exists():
+            return None
+        try:
+            conn = sqlite3.connect(f"file:{dbp}?mode=ro", uri=True,
+                                   check_same_thread=False)
+            conn.row_factory = sqlite3.Row
+            conn.execute("SELECT 1 FROM fact_embeddings LIMIT 1")
+            return conn
+        except Exception:
+            return None
     if readonly:
         try:
             conn = sqlite3.connect(f"file:{dbp}?mode=ro", uri=True, check_same_thread=False)
@@ -512,8 +528,11 @@ def _is_factkit_store(store) -> bool:
         return False
 
 
-def _vectors_conn(store, *, readonly: bool = False):
+def _vectors_conn(store, *, readonly: bool = False, create: bool = True):
     """Connection holding ``fact_embeddings``, in precedence order.
+
+    ``create=False`` is for read-only diagnostics: it never creates factkit's
+    vectors DB and returns ``(None, True)`` when there is nothing to read.
 
     1. Provider handles (``holo.ReadOnlyStore``, ``StandaloneStore``, the
        provider's ``MemoryStore``) always use factkit's plugin DB: provider
@@ -527,7 +546,7 @@ def _vectors_conn(store, *, readonly: bool = False):
     4. Anything else falls back to factkit's plugin DB.
     """
     if _is_provider_store(store):
-        conn = _factkit_vectors_conn(readonly=readonly)
+        conn = _factkit_vectors_conn(readonly=readonly, create=create)
         return conn, True
 
     db = getattr(store, "db", None)
@@ -557,7 +576,7 @@ def _vectors_conn(store, *, readonly: bool = False):
                 except Exception:
                     pass
 
-    conn = _factkit_vectors_conn(readonly=readonly)
+    conn = _factkit_vectors_conn(readonly=readonly, create=create)
     return conn, True
 
 
@@ -1172,17 +1191,58 @@ def entity_boost(query: str, content: str, entities: str | None = "",
 _QUERY_CACHE = None
 
 
+def embed_cache_path() -> str:
+    """Query embedding cache: ``FACTKIT_EMBED_CACHE`` else the Hermes home file."""
+    import os
+    return os.environ.get("FACTKIT_EMBED_CACHE",
+                          str(_hermes_home() / "embed_cache.db"))
+
+
+def embed_cache_stats(path: str | Path | None = None) -> dict:
+    """Embedding-cache counters; a missing cache file is reported as empty.
+
+    Never creates the cache file, so ``factkit holo cache`` is safe to run on a
+    host that has never embedded anything.
+    """
+    from .embedcache import EmbedCache
+
+    target = Path(path or embed_cache_path()).expanduser()
+    if not target.exists():
+        return {"path": str(target), "entries": 0, "hits": 0,
+                "bytes": 0, "oldest": None}
+    cache = EmbedCache(target)
+    try:
+        stats = cache.stats()
+    finally:
+        cache.close()
+    return {"path": str(target), **stats}
+
+
+def prune_embed_cache(path: str | Path | None = None) -> dict:
+    """Enforce the cache TTL and size cap; a missing cache file is a no-op."""
+    from .embedcache import EmbedCache
+
+    target = Path(path or embed_cache_path()).expanduser()
+    if not target.exists():
+        return {"path": str(target), "expired": 0, "overflow": 0, "removed": 0,
+                "entries": 0,
+                "stats": {"entries": 0, "hits": 0, "bytes": 0, "oldest": None}}
+    cache = EmbedCache(target)
+    try:
+        pruned = cache.prune()
+        stats = cache.stats()
+    finally:
+        cache.close()
+    return {"path": str(target), **pruned, "stats": stats}
+
+
 def _query_cache():
     """Process-wide embedding cache; a cache fault must never break recall."""
     global _QUERY_CACHE
     if _QUERY_CACHE is None:
-        import os
         from .embedcache import EmbedCache
-        default_cache = None
-        default_cache = str(_hermes_home() / "embed_cache.db")
-        path = os.environ.get("FACTKIT_EMBED_CACHE", default_cache)
         try:
-            _QUERY_CACHE = EmbedCache(path)
+            _QUERY_CACHE = EmbedCache(embed_cache_path())
         except Exception:  # noqa: BLE001
             _QUERY_CACHE = False
     return _QUERY_CACHE or None
@@ -1349,8 +1409,16 @@ def prefetch(store, message: str, *, limit: int = 5, min_trust: float = 0.3,
 
 def index_pending(store, *, batch: int = 32, force: bool = False,
                   embed_api_key=None, embed_base_url=None,
-                  embed_model=None) -> dict:
-    """Embed facts that have no vector for the configured model (writes to factkit's own DB)."""
+                  embed_model=None, timeout: float | None = None) -> dict:
+    """Embed facts that have no vector for the configured model (writes to factkit's own DB).
+
+    ``timeout`` is a whole-run wall-clock budget in seconds. ``None`` (the
+    default) keeps the untimed behaviour exactly; when set, batches stop once
+    the budget is spent and the remainder comes back as ``timed_out`` with the
+    unprocessed rows counted as ``skipped``.
+    """
+    import time
+
     from .config import Config
     from .vectors import pack
 
@@ -1359,6 +1427,16 @@ def index_pending(store, *, batch: int = 32, force: bool = False,
     cfg = Config.load(str(getattr(store, "db_path", "") or "") or None)
     client, model = _resolve_embed(cfg, api_key=embed_api_key,
                                    base_url=embed_base_url, model=embed_model)
+    deadline = None
+    if timeout is not None and float(timeout) > 0:
+        deadline = time.monotonic() + float(timeout)
+        try:
+            client.timeout = max(
+                0.05,
+                min(float(getattr(client, "timeout", timeout) or timeout),
+                    float(timeout)))
+        except (TypeError, ValueError):
+            pass
     have = set()
     try:
         vconn, vclose = _vectors_conn(store, readonly=False)
@@ -1390,16 +1468,23 @@ def index_pending(store, *, batch: int = 32, force: bool = False,
         rows = []
     todo = [r for r in rows if force or int(r["fact_id"]) not in have]
     if not todo:
-        return {"model": model, "indexed": 0, "pending": 0}
+        return {"model": model, "indexed": 0, "pending": 0,
+                "failed": 0, "skipped": 0, "timed_out": False}
 
-    done = 0
+    done = skipped = 0
+    timed_out = False
     try:
         vconn, vclose = _vectors_conn(store, readonly=False)
         try:
             for i in range(0, len(todo), batch):
+                if deadline is not None and time.monotonic() >= deadline:
+                    timed_out = True
+                    skipped = len(todo) - done
+                    break
                 chunk = todo[i:i + batch]
                 vecs = client.embed([r["content"] for r in chunk])
                 if not vecs:
+                    skipped = len(todo) - done
                     break
                 for row, vec in zip(chunk, vecs):
                     vconn.execute(
@@ -1415,8 +1500,99 @@ def index_pending(store, *, batch: int = 32, force: bool = False,
             if vclose:
                 vconn.close()
     except Exception as exc:  # noqa: BLE001 - endpoint down: report, do not raise
-        return {"model": model, "indexed": done, "pending": len(todo) - done, "error": str(exc)}
-    return {"model": model, "indexed": done, "pending": len(todo) - done}
+        return {"model": model, "indexed": done, "pending": len(todo) - done,
+                "failed": len(todo) - done, "skipped": 0, "timed_out": False,
+                "error": str(exc)}
+    return {"model": model, "indexed": done, "pending": len(todo) - done,
+            "failed": 0, "skipped": skipped, "timed_out": timed_out}
+
+
+# --------------------------------------------------------- coverage backlog
+def plugin_health() -> dict:
+    """Best-effort health counters from the installed plugin, or ``{}``.
+
+    The counters are process-local: a CLI process usually imports a fresh
+    module with empty counters, while a hook-hosted caller sees the real
+    numbers. Any import or call failure degrades to ``{}`` silently.
+    """
+    import importlib
+
+    for name in ("plugins.factkit", "factkit_plugin"):
+        try:
+            module = importlib.import_module(name)
+        except Exception:  # noqa: BLE001 - not installed, or half-imported
+            continue
+        health_fn = getattr(module, "health", None)
+        if callable(health_fn):
+            try:
+                return dict(health_fn())
+            except Exception:  # noqa: BLE001
+                continue
+    return {}
+
+
+def _store_fact_count(store) -> int:
+    counter = getattr(store, "count_facts", None)
+    if callable(counter):
+        try:
+            return int(counter())
+        except Exception:  # noqa: BLE001 - fall through to a raw count
+            pass
+    try:
+        reader = getattr(store, "read", None)
+        rows = reader("SELECT COUNT(*) AS n FROM facts") if reader else []
+        if rows:
+            row = rows[0]
+            return int(row["n"] if not isinstance(row, dict) else dict(row)["n"])
+    except Exception:  # noqa: BLE001
+        pass
+    return 0
+
+
+def _embedded_fact_count(store, model: str) -> int:
+    """Rows for ``model`` in the same vectors DB ``index_pending`` writes to.
+
+    Provider stores share factkit's global vectors DB, exactly like the
+    ``have`` set ``index_pending`` uses to decide what still needs embedding.
+    """
+    try:
+        conn, close = _vectors_conn(store, readonly=True, create=False)
+    except Exception:  # noqa: BLE001
+        return 0
+    if conn is None:
+        return 0
+    try:
+        row = conn.execute(
+            "SELECT COUNT(DISTINCT fact_id) FROM fact_embeddings WHERE model = ?",
+            (model,)).fetchone()
+        return int(row[0] or 0)
+    except Exception:  # noqa: BLE001 - a store without the table has no vectors
+        return 0
+    finally:
+        if close:
+            conn.close()
+
+
+def embedding_coverage(store, *, model: str | None = None) -> dict:
+    """Read-only backlog view: how many facts have a vector for ``model``.
+
+    Never creates the store, the vectors DB or a cache entry: an absent
+    factkit vectors DB counts as zero embedded facts.
+    """
+    from .config import Config
+
+    cfg = Config.load(str(getattr(store, "db_path", "") or "") or None)
+    target = str(model or cfg.embed_model)
+    facts = _store_fact_count(store)
+    embedded = _embedded_fact_count(store, target)
+    return {
+        "model": target,
+        "facts": facts,
+        "embedded_for_model": embedded,
+        "missing": max(0, facts - embedded),
+        "coverage": 1.0 if facts == 0 else round(min(embedded, facts) / facts, 3),
+        "last_error": str(plugin_health().get("last_error") or ""),
+    }
 
 
 # ------------------------------------------------------------ rank fusion

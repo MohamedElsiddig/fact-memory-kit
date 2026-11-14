@@ -79,8 +79,9 @@ def seeded(store):
     return store, embedder
 
 
-def report(store, embedder, cases, k=5):
-    return live_metrics.evaluate(store, cases, k=k, embedder=embedder)
+def report(store, embedder, cases, k=5, min_score=None):
+    return live_metrics.evaluate(store, cases, k=k, embedder=embedder,
+                                 min_score=min_score)
 
 
 # ------------------------------------------------------------------ evaluate
@@ -216,6 +217,74 @@ def test_report_is_json_serialisable(seeded):
     json.dumps(broken)
     assert broken["invalid"] == 3
     assert broken["cases"] == 0
+
+
+# ------------------------------------------------------------------ min_score
+class OrthogonalEmbedder:
+    """Query vector orthogonal to every stored vector, so cosine is 0.0."""
+
+    model = "fake-embed"
+    dims = 2
+
+    def embed_one(self, text):
+        return [1.0, 0.0]
+
+    def embed(self, texts):
+        return [self.embed_one(t) for t in texts]
+
+
+def test_min_score_default_is_none_and_keeps_todays_ranking(seeded):
+    store, embedder = seeded
+    result = report(store, embedder, CASES)
+    assert result["min_score"] is None
+
+    # A floor below every cosine admits the same candidates, so the ranking is
+    # byte-for-byte today's apart from the additive min_score field.
+    unfiltered = report(store, embedder, CASES, min_score=-1.0)
+    assert unfiltered["min_score"] == -1.0
+    assert ({key: value for key, value in unfiltered.items() if key != "min_score"}
+            == {key: value for key, value in result.items() if key != "min_score"})
+
+
+def test_min_score_filters_the_vector_channel_only(tmp_path):
+    store = Store(tmp_path / "floor.db")
+    embedder = OrthogonalEmbedder()
+    try:
+        fact = store.add_fact("Atlas Server has 16 GB RAM", trust_score=0.9)
+        store.put_embedding(fact["fact_id"], embedder.model, [0.0, 1.0])
+        store.db.commit()
+        case = [{"query": "atlas server ram", "expect": [fact["fact_id"]]}]
+
+        before = report(store, embedder, case)
+        assert before["retrieval"] == "hybrid"      # cosine 0.0 still competes
+
+        after = report(store, embedder, case, min_score=0.5)
+        assert after["retrieval"] == "lexical"      # the vector candidate was floored
+        assert after["min_score"] == 0.5
+        assert after["hit_rate"] == 1.0             # the BM25 hit survives the filter
+        assert after["results"][0]["rank"] == 1
+    finally:
+        store.close()
+
+
+def test_min_score_junk_disables_the_floor(seeded):
+    store, embedder = seeded
+    for bad in ("nonsense", float("nan")):
+        result = report(store, embedder, CASES, min_score=bad)
+        assert result["min_score"] is None
+        assert result["hit_rate"] == 1.0
+
+
+# ------------------------------------------------------------------- history
+def test_history_row_has_the_stable_fields():
+    row = live_metrics.history_row(
+        {"cases": 3, "hit_rate": 1.0, "mrr": 0.9, "k": 5, "total": 7},
+        {"ok": True, "reasons": []}, ts="2026-11-14T09:00:00+00:00")
+
+    assert row == {"ts": "2026-11-14T09:00:00+00:00", "cases": 3,
+                   "hit_rate": 1.0, "mrr": 0.9, "k": 5, "gate_ok": True}
+    # A failing gate is data, not an omission.
+    assert live_metrics.history_row({}, {"ok": False})["gate_ok"] is False
 
 
 # ------------------------------------------------------------------- compare

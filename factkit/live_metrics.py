@@ -13,8 +13,9 @@ the vector channel, otherwise retrieval is lexical (BM25) only.
 
 Ranking mirrors :class:`factkit.hybrid.HybridSearch`: BM25 over the fact text and
 cosine over the stored embeddings, fused with reciprocal-rank fusion and a
-deterministic ``fact_id`` tie-break. No trust/score threshold is applied, so a
-miss is a pure ranking miss, not a filtered-out fact.
+deterministic ``fact_id`` tie-break. No trust/score threshold is applied unless
+the caller passes ``min_score``, which floors only the vector channel; a miss is
+otherwise a pure ranking miss, not a filtered-out fact.
 """
 from __future__ import annotations
 
@@ -23,6 +24,7 @@ import math
 import re
 import sqlite3
 from collections import Counter
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -313,8 +315,13 @@ def _vector_ranks(qvec, embedded: dict[int, Any]):
     return scored
 
 
-def _search(query: str, snapshot: _Snapshot, k: int, embedder):
-    """Top-``k`` fact ids for ``query``; RRF of BM25 and cosine ranks."""
+def _search(query: str, snapshot: _Snapshot, k: int, embedder, min_score=None):
+    """Top-``k`` fact ids for ``query``; RRF of BM25 and cosine ranks.
+
+    ``min_score`` drops vector candidates whose cosine falls below the floor
+    before fusion. The lexical channel is never filtered: a BM25 candidate that
+    the embeddings dislike still competes for a place.
+    """
     pool = max(k * 6, 40)
     lexical = _bm25(query, snapshot.facts)[:pool]
     qvec = _embed_query(embedder, query)
@@ -322,7 +329,10 @@ def _search(query: str, snapshot: _Snapshot, k: int, embedder):
     if isinstance(qvec, dict):
         warning = f"embedding failed; scoring lexically: {qvec['error']}"
         qvec = None
-    vector = _vector_ranks(qvec, snapshot.embedded)[:pool]
+    vector = _vector_ranks(qvec, snapshot.embedded)
+    if min_score is not None:
+        vector = [(fid, score) for fid, score in vector if score >= min_score]
+    vector = vector[:pool]
 
     scores: dict[int, float] = {}
     for rank, (fid, _) in enumerate(lexical, 1):
@@ -334,7 +344,19 @@ def _search(query: str, snapshot: _Snapshot, k: int, embedder):
 
 
 # ------------------------------------------------------------------ evaluate
-def evaluate(store, cases, *, k: int = DEFAULT_K, embedder=None) -> dict:
+def _min_score(value) -> float | None:
+    """Normalise the optional vector-admission floor; ``None`` means no floor."""
+    if value is None:
+        return None
+    try:
+        score = float(value)
+    except (TypeError, ValueError):
+        return None
+    return None if math.isnan(score) else score
+
+
+def evaluate(store, cases, *, k: int = DEFAULT_K, embedder=None,
+             min_score: float | None = None) -> dict:
     """Score retrieval over the live store. Read-only and JSON-serialisable.
 
     ``cases`` is a list of ``{"query": str, "expect": [fact_id, ...]}`` dicts
@@ -346,11 +368,16 @@ def evaluate(store, cases, *, k: int = DEFAULT_K, embedder=None) -> dict:
     Cases whose expected ids are all unknown are *not* scored as misses: they
     are listed under ``unknown`` and excluded from the aggregates, so a stale
     golden file cannot silently depress the numbers.
+
+    ``min_score`` floors the vector channel: cosine candidates below it are
+    dropped before reciprocal-rank fusion, while BM25 candidates are never
+    filtered. ``None`` (the default) is today's unfiltered ranking.
     """
     try:
         k = max(1, int(k))
     except (TypeError, ValueError):
         k = DEFAULT_K
+    floor = _min_score(min_score)
 
     snapshot = _snapshot(store, embedder)
     known = {int(f["fact_id"]) for f in snapshot.facts}
@@ -384,7 +411,7 @@ def evaluate(store, cases, *, k: int = DEFAULT_K, embedder=None) -> dict:
                             "scored": False, "unknown": missing})
             continue
 
-        got, warning, used_vectors = _search(query, snapshot, k, embedder)
+        got, warning, used_vectors = _search(query, snapshot, k, embedder, floor)
         hybrid_used = hybrid_used or used_vectors
         if warning and warning not in warnings:
             warnings.append(warning)
@@ -406,6 +433,7 @@ def evaluate(store, cases, *, k: int = DEFAULT_K, embedder=None) -> dict:
 
     return {
         "k": k,
+        "min_score": floor,
         "model": snapshot.model,
         "retrieval": "hybrid" if hybrid_used else "lexical",
         "cases": scored,
@@ -539,6 +567,45 @@ def compare(before, after) -> dict:
         "mrr_delta": round(after_mrr - before_mrr, 6),
         "degraded": bool(hit_lost) or mrr_drop > 0.05,
     }
+
+
+# ------------------------------------------------------------------- history
+def history_row(result, verdict, *, ts: str | None = None) -> dict:
+    """One JSONL record for :func:`append_history`; the field set is stable.
+
+    ``cases`` is the number of *scored* cases, so a run whose expectations are
+    all unknown records ``0`` instead of a misleading total. ``gate_ok`` keeps a
+    failed gate as data, which is what ``--report --save`` needs.
+    """
+    result = result if isinstance(result, dict) else {}
+    verdict = verdict if isinstance(verdict, dict) else {}
+    try:
+        cases = int(result.get("cases") or 0)
+    except (TypeError, ValueError):
+        cases = 0
+    return {
+        "ts": ts or datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "cases": cases,
+        "hit_rate": result.get("hit_rate", 0.0),
+        "mrr": result.get("mrr", 0.0),
+        "k": result.get("k", DEFAULT_K),
+        "gate_ok": bool(verdict.get("ok")),
+    }
+
+
+def append_history(path, result, verdict, *, ts: str | None = None) -> Path:
+    """Append one :func:`history_row` line to ``path``; return the resolved path.
+
+    The parent directory is created and the file is opened in append mode: a
+    metrics history is a time series, and a failing run must still be recorded.
+    Raises ``OSError`` when the target cannot be written.
+    """
+    target = Path(path).expanduser()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    row = history_row(result, verdict, ts=ts)
+    with target.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(row, ensure_ascii=False) + "\n")
+    return target
 
 
 # ---------------------------------------------------------------------- gate

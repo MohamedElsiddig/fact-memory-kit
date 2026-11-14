@@ -220,6 +220,21 @@ def test_vectors_conn_keeps_factkit_store_on_own_db(tmp_path):
         readonly.close()
 
 
+def test_vectors_conn_create_false_never_creates_the_vectors_db(monkeypatch, tmp_path):
+    """A read-only diagnostic (``holo index``) must not create factkit's DB."""
+    provider, _ = _make_provider(tmp_path, [("Atlas Server has 16 GB RAM", 0.9)])
+    factkit_db = tmp_path / "factkit-vectors.db"
+    monkeypatch.setattr(holo, "_factkit_vectors_db_path", lambda **kw: factkit_db)
+
+    store = holo.ReadOnlyStore(provider)
+    try:
+        conn, close = holo._vectors_conn(store, readonly=True, create=False)
+        assert conn is None and close is True
+        assert not factkit_db.exists()
+    finally:
+        store.close()
+
+
 def test_duck_adapter_keeps_legacy_read_through(monkeypatch, tmp_path):
     """A non-provider adapter that owns its vectors still works (test_scoring shape)."""
     path = tmp_path / "duck.db"

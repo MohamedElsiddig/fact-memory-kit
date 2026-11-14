@@ -254,13 +254,36 @@ with the pair and confidence in the evidence JSON.
 ### Live retrieval metrics
 
 ```bash
-factkit holo metrics --db $DB --smoke cases.json
+factkit holo metrics --db $DB --smoke cases.json            # gate: exit 1 on failure
+factkit holo metrics --db $DB --smoke cases.json --report   # report only: always exit 0
+factkit holo metrics --db $DB --smoke cases.json --save     # append a history row too
+factkit holo metrics --db $DB --smoke cases.json --min-score 0.35   # vector floor A/B
 ```
 
-Runs hybrid retrieval (BM25 + cosine) over the live store, reports hit@k, MRR
-and per-case ranks, and exits 1 when the gate fails. Cases use
-`{"query": ..., "expect": [fact_id, ...]}`; unknown ids are reported instead of
-being scored as misses.
+Runs hybrid retrieval (BM25 + cosine) over the live store and reports hit@k, MRR
+and per-case ranks. By default it is a gate: exit 1 when hit@k or MRR falls below
+the thresholds. Use `--report` when a failing gate is data rather than an error
+(a dashboard run, or a shell that must not abort): it prints the same payload,
+gate verdict included, but always exits 0.
+
+Cases use `{"query": ..., "expect": [fact_id, ...]}`; unknown ids are reported
+instead of being scored as misses. **Ids must come from the store being
+measured** - a golden file generated against a demo database scores nothing
+useful against the live one (its stale ids show up under `unknown`/`warnings`).
+
+`--min-score` floors only the vector channel: cosine candidates below it are
+dropped before fusion, while BM25 candidates are never filtered. Omit it for the
+unfiltered ranking; use it to A/B an admission floor without editing config.
+
+`--save [PATH]` appends one JSON line per run to `~/.hermes/factkit-metrics.jsonl`
+by default (parent directories are created):
+
+```json
+{"ts": "2026-11-14T09:00:00+00:00", "cases": 12, "hit_rate": 0.92, "mrr": 0.88, "k": 5, "gate_ok": true}
+```
+
+`cases` counts scored cases. The row is appended even when `--report` exits 0 on
+a failing gate, so the history records failures as data.
 
 ### Store limits, archive and backups
 
@@ -304,6 +327,36 @@ Query embeddings are cached in `~/.hermes/embed_cache.db` (sqlite, float32,
 768 dims ~3 KB/vector, 30-day TTL, 5000 entries). Warm queries drop from
 ~0.13s to ~0.02s; a cache fault falls back to the endpoint and never fails a
 turn. Override the path with `FACTKIT_EMBED_CACHE`.
+
+```bash
+factkit holo cache              # {path, entries, hits, bytes, oldest}
+factkit holo cache --prune      # enforce the TTL and 5000-entry cap, report removed
+```
+
+`holo cache` reads the same file the hook uses (`FACTKIT_EMBED_CACHE`, else
+`<hermes home>/embed_cache.db`) and never creates it: a host that has never
+embedded reports `entries: 0` and exits 0. `--prune` applies the 30-day TTL and
+the entry cap, then prints `{expired, overflow, removed, entries}` with stats
+after pruning; on a missing file it reports zeros and creates nothing. The TTL
+and cap are `EmbedCache` defaults, not config keys.
+
+### Indexing backlog
+
+```bash
+factkit holo index --db $DB             # {facts, embedded_for_model, missing, coverage, last_error}
+factkit holo index --db $DB --apply     # embed pending facts (default 30s budget)
+factkit holo index --db $DB --apply --timeout 120
+```
+
+Read-only by default: it counts facts and vectors for the configured
+`embed_model`, reads factkit's own vectors DB without creating it, and reports
+`coverage` (`1.0` for an empty store). `last_error` comes from the plugin's
+`health()` counters when the plugin is importable and stays empty otherwise.
+
+`--apply` runs `index_pending` in this process with a whole-run wall-clock
+budget (`--timeout`, default 30s) and reports `{embedded, failed, skipped,
+pending, timed_out}`; a missing store is an error (exit 2), never an empty
+database. Unlike the hook, the CLI does not consult or trip the recall breaker.
 
 ## Experiments and opt-in paths
 
@@ -424,6 +477,7 @@ fact through the review path remaps its cases to the survivor.
 | `FACTKIT_EMBED_API_KEY` | empty | bearer token |
 | `FACTKIT_EMBED_BATCH` | 32 | inputs per request |
 | `FACTKIT_EMBED_TIMEOUT` | 20 | seconds |
+| `FACTKIT_EMBED_CACHE` | `~/.hermes/embed_cache.db` | query embedding cache (`holo cache`) |
 | `FACTKIT_LLM_BASE_URL` / `_MODEL` / `_API_KEY` | local server / `local-model` | bridge and router fallback |
 | `FACTKIT_TTL_DAYS` | 90 | age horizon |
 | `FACTKIT_SLOT_TTL_DAYS` | 180 | volatile-attribute horizon |
@@ -432,7 +486,21 @@ fact through the review path remaps its cases to the survivor.
 
 Plugin-only keys (`config.yaml`, env overrides in brackets): `prefetch`
 [`FACTKIT_PREFETCH`], `limit` [`FACTKIT_PREFETCH_LIMIT`], `min_score`
-[`FACTKIT_PREFETCH_MIN`], `db` [`FACTKIT_DB`].
+[`FACTKIT_PREFETCH_MIN`], `db` [`FACTKIT_DB`], `namespace` [`FACTKIT_NAMESPACE`].
+
+Recall tuning knobs, with the plugin defaults they fall back to:
+
+| Key | Default | Effect |
+|---|---|---|
+| `min_score` | 0.55 (`FACTKIT_PREFETCH_MIN`) | cosine floor for facts injected into context |
+| `semantic_weight` | 0.5 | weight of the embedding channel when fusing tool results |
+| `embed_timeout_ms` | 1500 | hard deadline for the embedding call inside the hook |
+| `breaker_seconds` | 300 | how long semantic recall is skipped after 3 consecutive failures |
+
+`min_score` is also exposed on the CLI as `factkit holo metrics --min-score` for
+A/B runs; that flag changes only the measurement, never the hook config. The
+CLI embed path uses `FACTKIT_EMBED_TIMEOUT` (seconds), separate from the hook's
+`embed_timeout_ms` deadline.
 
 ## Standalone extras
 
