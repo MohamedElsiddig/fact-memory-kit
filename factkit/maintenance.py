@@ -48,6 +48,8 @@ CREATE TABLE IF NOT EXISTS fact_tombstones (
     trust_score REAL,
     entities TEXT,
     hrr_vector BLOB,
+    valid_from TEXT,
+    valid_to TEXT,
     retired_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     retired_by TEXT,
     reason TEXT,
@@ -74,7 +76,7 @@ _PROPOSALS = (
 )
 
 _COLUMNS = ("fact_id, content, category, tags, trust_score, entities, hrr_vector, "
-            "retired_at, retired_by, reason, batch_id, restored_at")
+            "valid_from, valid_to, retired_at, retired_by, reason, batch_id, restored_at")
 
 
 # ------------------------------------------------------------------- helpers
@@ -127,11 +129,45 @@ def _one(store, sql: str, params=()) -> dict | None:
     return rows[0] if rows else None
 
 
-def _fact_columns(store) -> set[str]:
+def _table_columns(store, table: str) -> set[str]:
+    """Column names of *table*; empty when the store cannot be probed."""
     try:
-        return {str(row[0]) for row in store.read("PRAGMA table_info(facts)")}
+        rows = store.read(f"PRAGMA table_info({table})")
     except Exception:  # noqa: BLE001 - schema probe must never be fatal
         return set()
+    names = set()
+    for row in rows:
+        try:
+            name = dict(row).get("name")       # sqlite3.Row / mapping
+        except (TypeError, ValueError):
+            name = row[1] if len(row) > 1 else None  # plain tuple: (cid, name, ...)
+        if name:
+            names.add(str(name))
+    return names
+
+
+def _fact_columns(store) -> set[str]:
+    return _table_columns(store, "facts")
+
+
+def _ensure_columns(store, table: str, columns) -> None:
+    """Additive migration: add missing columns, never rewrite or drop.
+
+    ``CREATE TABLE IF NOT EXISTS`` cannot widen a table that predates the
+    columns, so an existing store is migrated with ``ALTER TABLE ... ADD
+    COLUMN``.  A concurrent add (duplicate column) is not a failure; the caller
+    falls back to whatever columns actually exist.
+    """
+    existing = _table_columns(store, table)
+    if not existing:  # unreadable schema: the CREATE above already has the columns
+        return
+    for name, ddl in columns:
+        if name in existing:
+            continue
+        try:
+            _write(store, f"ALTER TABLE {table} ADD COLUMN {ddl}")
+        except Exception:  # noqa: BLE001 - duplicate column from a concurrent add
+            pass
 
 
 def _declared_entities(store, fact_id: int) -> list[str]:
@@ -176,6 +212,8 @@ def ensure_tombstones(store) -> None:
     _write(store, _INDEX)
     _write(store, _AUDIT)
     _write(store, _PROPOSALS)
+    _ensure_columns(store, "fact_tombstones",
+                    (("valid_from", "valid_from TEXT"), ("valid_to", "valid_to TEXT")))
 
 
 def tombstone_fact(store, fact_id, *, reason: str = "", batch_id=None,
@@ -196,20 +234,32 @@ def tombstone_fact(store, fact_id, *, reason: str = "", batch_id=None,
     wanted = ["fact_id", "content", "category", "tags", "trust_score"]
     if "hrr_vector" in columns:
         wanted.append("hrr_vector")
+    for name in ("valid_from", "valid_to"):
+        if name in columns:
+            wanted.append(name)
     row = _one(store, f"SELECT {', '.join(wanted)} FROM facts WHERE fact_id = ?", (fid,))
     if row is None:
         raise ValueError(f"fact {fid} not found")
 
     entities = _declared_entities(store, fid)
+    fields = ["fact_id", "content", "category", "tags", "trust_score", "entities",
+              "hrr_vector", "retired_by", "reason", "batch_id"]
+    params = [fid, row["content"], row.get("category"), row.get("tags"),
+              row.get("trust_score"), json.dumps(entities), row.get("hrr_vector"),
+              by, reason, batch_id]
+    # Validity is captured only when both sides of the snapshot have the
+    # additive columns, so a provider schema that predates them still snapshots.
+    tombstone_columns = _table_columns(store, "fact_tombstones")
+    for name in ("valid_from", "valid_to"):
+        if name in tombstone_columns:
+            fields.append(name)
+            params.append(row.get(name))
     _write(
         store,
         "INSERT OR REPLACE INTO fact_tombstones "
-        "(fact_id, content, category, tags, trust_score, entities, hrr_vector, "
-        " retired_at, retired_by, reason, batch_id, restored_at) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, ?, ?, ?, NULL)",
-        (fid, row["content"], row.get("category"), row.get("tags"),
-         row.get("trust_score"), json.dumps(entities), row.get("hrr_vector"),
-         by, reason, batch_id),
+        f"({', '.join(fields)}, retired_at, restored_at) "
+        f"VALUES ({', '.join('?' for _ in fields)}, CURRENT_TIMESTAMP, NULL)",
+        tuple(params),
     )
     stored = _get(store, fid)
     if stored is None:  # pragma: no cover - the insert above either lands or raises

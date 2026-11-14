@@ -95,6 +95,7 @@ def _config() -> dict:
         ("embed_base_url", "FACTKIT_EMBED_BASE_URL"),
         ("embed_model", "FACTKIT_EMBED_MODEL"),
         ("db", "FACTKIT_DB"),
+        ("namespace", "FACTKIT_NAMESPACE"),
     ):
         if os.environ.get(env):
             data[key] = os.environ[env]
@@ -119,6 +120,13 @@ def _config() -> dict:
             data["embed_api_key"] = os.environ["FACTKIT_EMBED_API_KEY"]
     _CFG = data
     return data
+
+
+def _namespace():
+    """Optional recall scope from config/env; None means the whole store."""
+    value = _config().get("namespace")
+    text = "" if value is None else str(value).strip()
+    return text or None
 
 
 def _embed_kwargs() -> dict:
@@ -548,6 +556,7 @@ def on_pre_llm_call(**kwargs):
             limit=_limit(),
             min_score=_min_score(),
             timeout=_num("embed_timeout_ms", 1500) / 1000.0,
+            namespace=_namespace(),
             **_embed_kwargs(),
         )
     except Exception as exc:  # noqa: BLE001 - recall must never break a turn
@@ -694,6 +703,7 @@ def on_transform_tool_result(tool_name: str = "", args=None, result=None, **kwar
             semantic_weight=_num("semantic_weight", 0.5),
             limit=want,
             timeout=_num("embed_timeout_ms", 1500) / 1000.0,
+            namespace=_namespace(),
             **_embed_kwargs(),
         )
     except Exception as exc:  # noqa: BLE001

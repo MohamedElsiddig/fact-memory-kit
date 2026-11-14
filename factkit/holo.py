@@ -841,6 +841,47 @@ def find_conflicts(db_path: str | Path, overlap_min: float = 0.35,
 
 
 # ------------------------------------------------------------------ apply
+def _stamp_retirement(store, keep_id: int, retire_id: int) -> None:
+    """Best-effort temporal bounds before a retirement deletes the row.
+
+    A provider schema may predate the additive ``valid_from``/``valid_to``
+    columns, and the shipped subset may omit :mod:`factkit.temporal`; in either
+    case retirement must proceed exactly as before.  Stamping runs before the
+    tombstone snapshot so the retired row's ``valid_to`` is captured in it.
+    """
+    try:
+        from . import temporal
+    except ImportError:
+        return
+    try:
+        columns = {str(dict(row).get("name") or "")
+                   for row in store.read("PRAGMA table_info(facts)")}
+    except Exception:  # noqa: BLE001 - a schema probe must not block retirement
+        return
+
+    from datetime import datetime, timezone
+
+    now = datetime.now(timezone.utc)
+    try:
+        if "valid_to" in columns:
+            temporal.stamp(store, retire_id, valid_to=now)
+    except Exception:  # noqa: BLE001 - an un-stamped retirement still proceeds
+        pass
+    try:
+        if "valid_from" in columns:
+            row = store._one(
+                "SELECT valid_from, created_at FROM facts WHERE fact_id = ?", (keep_id,))
+            if row is not None and row["valid_from"] is None:
+                try:
+                    start = (temporal.normalize_ts(row["created_at"])
+                             if row["created_at"] else None)
+                except ValueError:
+                    start = None
+                temporal.stamp(store, keep_id, valid_from=start or now)
+    except Exception:  # noqa: BLE001 - the kept fact is still kept
+        pass
+
+
 def apply_conflict(store, pair: dict, *, dry_run: bool = True, batch_id: str | None = None) -> dict:
     """Retire the older fact, keeping the newer text as the single truth."""
     keep_id, retire_id = int(pair["keep"]), int(pair["retire"])
@@ -855,6 +896,9 @@ def apply_conflict(store, pair: dict, *, dry_run: bool = True, batch_id: str | N
         return {"ok": True, "dry_run": True, "keep": keep_id, "retire": retire_id,
                 "action": "update keep + remove retire"}
 
+    # 0. record when the old claim stopped and the kept one started, before
+    #    the tombstone snapshots and the retirement deletes the row
+    _stamp_retirement(store, keep_id, retire_id)
     # 1. keep the authoritative text (identical => already correct, no touch)
     store.update_fact(keep_id, content=keep["content"], category=keep["category"],
                       tags=keep["tags"], touch=False)
@@ -952,6 +996,7 @@ def apply_merge(store, pair: dict, *, dry_run: bool = True, batch_id: str | None
         return {"ok": False, "reason": "fact disappeared"}
     from . import maintenance
     maintenance.ensure_tombstones(store)
+    _stamp_retirement(store, keep_id, retire_id)
     maintenance.tombstone_fact(store, retire_id, reason="duplicate", batch_id=batch_id)
     store.remove_fact(retire_id)
     with store._tx():
@@ -1161,10 +1206,27 @@ def _resolve_embed(cfg, *, api_key=None, base_url=None, model=None):
     )
 
 
+def _namespace_filter(namespace):
+    """Row filter for a namespace scope, or None when scoping is off.
+
+    The shipped Hermes subset may omit :mod:`factkit.namespaces`, so the import
+    is lazy: a missing module degrades recall to unscoped instead of raising. An
+    empty name means "the whole store", matching the plugin's default.
+    """
+    name = "" if namespace is None else str(namespace).strip()
+    if not name:
+        return None
+    try:
+        from .namespaces import filter_rows
+    except ImportError:
+        return None
+    return lambda rows: filter_rows(rows, name)
+
+
 def prefetch(store, message: str, *, limit: int = 5, min_trust: float = 0.3,
              min_score: float = 0.35, timeout: float = 1.5,
              embed_api_key=None, embed_base_url=None,
-             embed_model=None) -> list[dict] | None:
+             embed_model=None, namespace=None) -> list[dict] | None:
     """Semantic recall for a user message.
 
     Reads facts from the read-only provider store and vectors from factkit's own DB.
@@ -1194,6 +1256,7 @@ def prefetch(store, message: str, *, limit: int = 5, min_trust: float = 0.3,
     except Exception:  # noqa: BLE001 - older stores may not expose PRAGMA
         columns = set()
     entity_column = "f.entities" if "entities" in columns else "NULL"
+    tags_column = "f.tags" if "tags" in columns else "NULL"
 
     # Get vectors from factkit's own DB (or the store's own DB for Store)
     vec_rows = {}
@@ -1233,7 +1296,8 @@ def prefetch(store, message: str, *, limit: int = 5, min_trust: float = 0.3,
     try:
         placeholders = ",".join("?" for _ in fact_ids)
         rows = [dict(r) for r in store.read(
-            f"SELECT f.fact_id, f.content, f.trust_score, {entity_column} AS entities "
+            f"SELECT f.fact_id, f.content, f.trust_score, {entity_column} AS entities, "
+            f"{tags_column} AS tags "
             f"FROM facts f WHERE f.fact_id IN ({placeholders})",
             tuple(fact_ids))]
     except Exception:
@@ -1271,11 +1335,15 @@ def prefetch(store, message: str, *, limit: int = 5, min_trust: float = 0.3,
                                frow.get("entities"))
         score = cosine + boost
         hit = {"fact_id": int(fid), "content": frow["content"],
-               "score": round(score, 4), "trust": round(float(frow.get("trust_score") or 0), 2)}
+               "score": round(score, 4), "trust": round(float(frow.get("trust_score") or 0), 2),
+               "tags": frow.get("tags")}
         if boost:
             hit["boost"] = round(boost, 4)
         out.append(hit)
     out.sort(key=lambda r: -r["score"])
+    scope = _namespace_filter(namespace)
+    if scope is not None:
+        out = scope(out)
     return out[:limit]
 
 
@@ -1360,8 +1428,13 @@ def fuse_results(store, query: str, provider_facts: list[dict], *,
                  semantic_weight: float = 0.5, limit: int = 10,
                  min_trust: float = 0.3, timeout: float = 1.5,
                  embed_api_key=None, embed_base_url=None,
-                 embed_model=None) -> list[dict] | None:
+                 embed_model=None, namespace=None) -> list[dict] | None:
     """Re-rank provider hits with an embedding channel (RRF), keeping every provider fact.
+
+    Provider rows own the slots they returned; semantic-only rows may fill spare
+    slots (at most half the limit) without displacing a provider row, and the
+    result never exceeds ``limit``. When the provider returns more rows than
+    ``limit``, the first ``limit`` provider rows are returned unchanged.
 
     Returns the merged list, or None when embeddings are unavailable so the caller
     can return the provider's result untouched.
@@ -1371,7 +1444,7 @@ def fuse_results(store, query: str, provider_facts: list[dict], *,
     hits = prefetch(store, query, limit=1_000_000, min_trust=min_trust,
                     min_score=0.0, timeout=timeout,
                     embed_api_key=embed_api_key, embed_base_url=embed_base_url,
-                    embed_model=embed_model)
+                    embed_model=embed_model, namespace=namespace)
     if hits is None:
         return None
     sem_rank = {h["fact_id"]: i for i, h in enumerate(hits, 1)}
@@ -1392,16 +1465,19 @@ def fuse_results(store, query: str, provider_facts: list[dict], *,
     if limit and limit < len(provider_facts):
         return [by_id[fact["fact_id"]] for fact in provider_facts[:limit]]
 
-    # Reserve only the slots the provider channel left empty. A fixed cosine
-    # floor misbehaves: nomic puts weak matches at ~0.51, barely below strong
-    # ones, so rank-relative gating is used instead.
+    # Reserve only the slots the provider channel left empty, capped at half
+    # the limit so semantic padding cannot dominate the page. A fixed cosine
+    # floor misbehaves (nomic puts weak matches at ~0.51, barely below strong
+    # ones), so rank-relative gating is used instead. ``limit in (None, 0)``
+    # keeps the historical single-reserve behaviour.
     if limit:
         spare = max(0, limit - len(provider_facts))
         cap = min(max(1, limit // 2), spare)
     else:
-        cap = 1 if limit in (None, 0) else min(max(1, limit // 2), max(0, limit - len(provider_facts)))
+        cap = 1
     reserve: list[dict] = []
     cutoff = max(1, min(len(hits), 5))   # top-5 of the embedding channel
+    scope = _namespace_filter(namespace)
     for hit in hits[:cutoff]:
         if hit["fact_id"] in by_id:
             continue
@@ -1413,6 +1489,8 @@ def fuse_results(store, query: str, provider_facts: list[dict], *,
         if not row:
             continue
         fact = dict(row[0])
+        if scope is not None and not scope([fact]):
+            continue
         fact["score"] = round(score, 6)
         fact["semantic_score"] = hit["score"]
         fact["source"] = "semantic"
